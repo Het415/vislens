@@ -1,0 +1,62 @@
+{
+  "thresholds_version": "v1",
+  "calibrated": true,
+  "selected_method": "dhash",
+  "calibrated_on": "2026-09-20",
+  "_note": "Separate from data/image_rules/rules_v1.json on purpose. That file records Amazon's published requirements and changes when Amazon changes them; this one records OUR detector's measured calibration and changes when we re-measure. Mixing them would mean a recalibration bumped the 'Amazon rules verified_on' date.",
+  "_calibrated_false_means": "No threshold here has been measured against a labeled pair set. Until it has, find_near_duplicates() returns an empty report with calibrated=false and a reason, rather than inventing a cutoff. A detector reporting duplicates at an unmeasured threshold is reporting whatever its author felt like.",
+  "methods": {
+    "phash": {
+      "max_distance": null,
+      "bits": 64,
+      "_what": "DCT low-frequency block against its median. Robust to rescaling and recompression because those barely touch low frequencies."
+    },
+    "dhash": {
+      "max_distance": 8.0,
+      "bits": 64,
+      "_what": "Horizontal gradient signs on a 9x8 thumbnail. Cheap, sensitive to any global change."
+    },
+    "tiles": {
+      "max_distance": null,
+      "per_tile_max_bits": 10,
+      "n_tiles": 16,
+      "_what": "A dHash per cell of a 4x4 grid; distance is the number of DISAGREEING cells. Robust to LOCALIZED edits - a badge pasted in one corner destroys one or two cells and leaves fourteen. Does NOT buy crop robustness: a crop shifts content across cell boundaries so cell i no longer corresponds to cell i.",
+      "_per_tile_max_bits_is_also_uncalibrated": true
+    }
+  },
+  "_calibration_protocol": {
+    "_task_definition_correction": "The build plan proposed 'same-product-different-shot' pairs as POSITIVES. That is wrong for this task and would have trained the threshold on the wrong question. Near-duplicate detection asks 'are these the SAME IMAGE?' - a second, genuinely different photo of the same product is not a duplicate, it is a legitimate additional image the seller should have. Same-product-different-shot therefore belongs in the NEGATIVES, and it is the HARD negative that makes the measurement meaningful. (The 'different shots of one product' question is a real task, but it is the benchmark half's image2image retrieval task, not dedup.)",
+    "positives": "Scripted mutations of one source image, with known expected outcomes: resize 75%/50%, JPEG q60/q30, corner badge, centre watermark, 5% border crop, brightness shift.",
+    "hard_negatives": "Different images of the SAME product (same ASIN). The discriminating case.",
+    "easy_negatives": "Images from different ASINs.",
+    "reporting": "Precision and recall reported against hard and easy negatives SEPARATELY. A method that only separates easy negatives is not useful - a listing's own images are all of one product.",
+    "split": "Threshold picked on a dev split of ASINs and reported on held-out ASINs. Split by ASIN, not by pair, so a product's images cannot appear on both sides.",
+    "baselines": [
+      "random",
+      "raw-pixel MSE on 32x32 grayscale",
+      "dhash",
+      "phash",
+      "tiled dhash"
+    ],
+    "metrics": [
+      "ROC-AUC",
+      "precision and recall at the selected threshold"
+    ],
+    "pre_committed_outcome": "Perceptual hashing was designed for exactly this task, so it may beat or tie a CLIP embedding. If it does, report it and ship hashing only - that saves hosting a model, and it is the same pre-commitment this repo makes for frozen CLIP versus the fine-tune."
+  },
+  "calibration_report": "eval/reports/2026-09-20-near-dup-calibration.md",
+  "measured": {
+    "held_out_precision": 1.0,
+    "held_out_recall": 0.9886363636363636,
+    "held_out_f1": 0.9942857142857142,
+    "auc_hard_only": 1.0
+  },
+  "featureless_guard": {
+    "min_detail_std": 3.0,
+    "_is_a_guard_not_a_calibrated_threshold": "Unlike max_distance, this is not tuned against a labeled set - it exists to reject degenerate INPUT, not to decide a verdict. Every hash here encodes contrast structure, so an image with none produces a degenerate hash: measured, a flat white square and a flat grey square both hash to 0x0000000000000000 under dHash AND pHash, giving distance 0 between two visibly different images. Images below this std are excluded from dedup and reported as skipped, rather than being called duplicates of each other."
+  },
+  "group_mismatch": {
+    "gated_at": "methods[selected_method].max_distance",
+    "_why": "A mismatch is only reported when the nearest out-of-group image is within the CALIBRATED duplicate threshold. Without that gate the check reported a mismatch whenever an image's nearest neighbour happened to sit in another group at any distance - measured on seven real product images, all pairwise dHash distances fell between 19 and 35 bits, so the nearest-group ordering was arbitrary and 5 of 7 images were flagged. Reusing the measured duplicate threshold makes the claim precise: 'this image is a near-duplicate of an image you tagged to a different SKU.'"
+  }
+}
