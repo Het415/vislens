@@ -17,6 +17,7 @@ import collections
 import gzip
 import json
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -85,13 +86,44 @@ def test_untagged_and_empty_entries_are_ignored():
 # ── The split key ─────────────────────────────────────────────────────────────
 
 
-def test_split_is_deterministic_and_order_independent():
+def test_split_hash_is_deterministic():
     """Hash-based rather than a stored shuffle, so a clean clone reproduces it
-    with no split file to lose and adding rows does not reshuffle."""
+    with no split file to lose and adding rows does not reshuffle.
+
+    This covers `split_for` only. It used to be named for order-independence,
+    which made it look like it covered `assign_splits` as well — it did not,
+    and `assign_splits` was order-DEPENDENT the whole time. The test below is
+    the one that would have caught it.
+    """
     keys = [f"COMP{i}" for i in range(200)]
     first = [split_for(k) for k in keys]
     assert [split_for(k) for k in reversed(keys)] == list(reversed(first))
     assert first == [split_for(k) for k in keys]
+
+
+def test_assign_splits_is_independent_of_edge_order():
+    """The same graph must split the same way however the edges arrive.
+
+    It did not. The component key was the union-find root — whichever member
+    happened to arrive first — and the edge list comes from an unordered DuckDB
+    scan, so rebuilding an unchanged archive relabelled whole components
+    (train +118, val -214, test +39 on the 145K catalog). Every leak invariant
+    still passed, because components stayed intact and only their labels moved,
+    which is exactly why this needs its own test.
+    """
+    edges = [
+        ("P1", "imgA"),
+        ("P2", "imgA"),
+        ("P2", "imgB"),  # chains P1-P2-P3 into one component
+        ("P3", "imgB"),
+        ("P4", "imgC"),
+        ("P5", "imgC"),
+    ]
+    baseline, _ = assign_splits(edges)
+    for seed in range(25):
+        shuffled = edges[:]
+        random.Random(seed).shuffle(shuffled)
+        assert assign_splits(shuffled)[0] == baseline, f"seed {seed} reshuffled the split"
 
 
 def test_split_pattern_is_eighty_ten_ten():
@@ -154,7 +186,7 @@ def test_component_stats_are_reported():
     pairs = [("A", "i1"), ("B", "i1"), ("C", "i2"), ("D", "i3")]
     _, stats = assign_splits(pairs)
 
-    assert stats["components"] == 3          # {A,B}, {C}, {D}
+    assert stats["components"] == 3  # {A,B}, {C}, {D}
     assert stats["largest_component"] == 2
     assert stats["singleton_components"] == 2
     assert stats["largest_component_share"] == pytest.approx(0.5)
@@ -227,7 +259,24 @@ def _write_fixture_abo(base: Path) -> None:
         if i == 7:
             # Shares its main image with PROD008 — the leak case.
             row["main_image_id"] = "m008"
+        if i in (9, 10):
+            # Headed by the boilerplate banner. Two of them, because one
+            # product cannot demonstrate the failure: the prune removes the
+            # BOILER edge before the union-find runs, so these two are never
+            # joined into a component and the split is assigned to each
+            # independently — which is how the same image ends up heading rows
+            # in two different splits.
+            row["main_image_id"] = "BOILER"
         rows.append(row)
+
+    # Two listings for one ASIN that tie on (main_image_id, title) and differ
+    # only in `title_lang`. That is the shape that made the shard pack
+    # non-reproducible on the real archive — 101 tied groups, 99 of them
+    # language-only — and it is cheap to carry here so both scripts see it.
+    twin = dict(rows[11])
+    twin["country"] = "GB"
+    twin["item_name"] = [{"language_tag": "en_GB", "value": "Product 11"}]
+    rows.append(twin)
 
     half = len(rows) // 2
     for name, chunk in (("listings_0", rows[:half]), ("listings_1", rows[half:])):
@@ -298,12 +347,14 @@ def test_non_english_listing_is_in_the_catalog_but_not_the_pairs(built):
     perfectly good index and classification row and a useless training pair."""
     con = duckdb.connect()
     catalog = {
-        r[0] for r in con.execute(
+        r[0]
+        for r in con.execute(
             f"SELECT product_id FROM '{built['out'] / 'catalog.parquet'}'"
         ).fetchall()
     }
     pairs = {
-        r[0] for r in con.execute(
+        r[0]
+        for r in con.execute(
             f"SELECT product_id FROM '{built['out'] / 'pairs.parquet'}'"
         ).fetchall()
     }
@@ -318,7 +369,8 @@ def test_dimensions_are_named_orig_because_they_describe_the_original(built):
     describe its pixels."""
     con = duckdb.connect()
     cols = {
-        r[0] for r in con.execute(
+        r[0]
+        for r in con.execute(
             f"DESCRIBE SELECT * FROM '{built['out'] / 'product_images.parquet'}'"
         ).fetchall()
     }
@@ -372,6 +424,41 @@ def test_no_product_and_no_image_spans_two_splits(built):
 
     assert product_overlap == 0
     assert image_overlap == 0
+
+
+def test_a_listing_headed_by_a_generic_image_is_dropped(built):
+    """The leak the two checks above cannot see.
+
+    `catalog.main_image_id` comes straight from `listings` and never passes
+    through `edges`, so pruning a generic image leaves any listing headed by it
+    pointing at a dropped image — and, because the prune also removed the edge
+    that would have unioned those listings, each one gets its split assigned
+    independently. On the real archive that put five images, 57 catalog rows
+    and 43 pairs rows into two or three splits at once while both
+    `product_images` checks reported zero.
+    """
+    con = duckdb.connect()
+    for table in ("catalog", "pairs"):
+        ids = {
+            r[0]
+            for r in con.execute(
+                f"SELECT product_id FROM '{built['out'] / f'{table}.parquet'}'"
+            ).fetchall()
+        }
+        assert "PROD009" not in ids, table
+        assert "PROD010" not in ids, table
+    assert built["report"]["dropped_generic_main_image"] == 2
+
+
+def test_no_main_image_spans_two_splits(built):
+    """The third invariant, asserted on the table that actually carries it."""
+    con = duckdb.connect()
+    overlap = con.execute(
+        f"SELECT count(*) FROM (SELECT main_image_id FROM "
+        f"'{built['out'] / 'catalog.parquet'}' "
+        "GROUP BY main_image_id HAVING count(DISTINCT split) > 1)"
+    ).fetchone()[0]
+    assert overlap == 0
 
 
 def test_products_sharing_a_main_image_share_a_split(built):

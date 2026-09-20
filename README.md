@@ -27,13 +27,15 @@ Conventions, and the reasoning behind each: [CLAUDE.md](CLAUDE.md).
 | Semantic checks (text overlay, image role) | **specified, disabled** — local ONNX, gated on measured agreement |
 | Near-duplicate detection | **built** — calibrated, `dhash` @ ≤8, held-out P 1.000 / R 0.989 |
 | SKU group-mismatch finding | **built** — gated at the calibrated threshold |
-| ABO catalog build | **built** — 145,671 products, 535,734 images, leak closed |
+| ABO catalog build | **built** — 145,614 products, 535,602 images, two leaks closed |
+| WebDataset shard packing | **built** — 405,116 samples in 42 shards, ~30s, reproducible |
 | Encoder training | not started — needs GPU acquisition |
 | Retrieval eval harness | not started |
 | ListingLens client + agent wiring | **built** — in the sibling repo, 21 tests |
 | ABO `en_US` gate | **measured** — see below |
-| Split-leakage fix | **measured** — 27,554 leaking images → 0 |
-| CI | **built** — ruff + 223 tests, no secrets, no network, no GPU |
+| Split-leakage fix | **measured** — 27,554 leaking images → 0, then 5 more the packer caught |
+| Split reproducibility | **measured** — two builds, one byte-identical assignment |
+| CI | **built** — ruff + 239 tests, no secrets, no network, no GPU |
 
 Nothing above is claimed in a UI before it is backed by code. That rule exists because the
 predecessor repo shipped a landing page advertising *"CLIP model analyzes your product images for
@@ -310,6 +312,106 @@ by the build itself (which aborts) and by the test suite.
 
 ---
 
+## Packing: 398K loose files into 42 shards
+
+Kaggle allows a notebook ~500 output files and the archive holds 398,212 images,
+so the images go into WebDataset tar shards and training streams them.
+`scripts/pack_shards.py` computes the whole plan from the catalog first, then
+makes **one sequential pass** over `abo-images-small.tar` — the 3.0 GB source is
+never extracted, because extracting a tar in order to repack it writes 398K
+files to change nothing but how they are grouped. The full pack takes ~30s.
+
+Bytes are copied, never re-encoded: no resize, no recompression. That is
+`CLAUDE.md` §9 — preprocessing gets exactly one definition, and it is reserved
+for `vislens.data.transforms`, which training, eval and the ONNX export will all
+import. A packer that resized to 224 would be a second one, and the two would
+disagree silently rather than fail.
+
+Two roles, and an image is in exactly one of them:
+
+| series | samples | shards | size | what it is |
+|---|---|---|---|---|
+| `pairs-train` | 97,287 | 10 | 942 MB | the contrastive training set: image, title, metadata |
+| `pairs-val` | 11,747 | 2 | 113 MB | |
+| `pairs-test` | 12,107 | 2 | 117 MB | |
+| `index-train` | 228,619 | 22 | 2,166 MB | the rest of the retrieval corpus, no title |
+| `index-val` | 26,652 | 3 | 251 MB | |
+| `index-test` | 28,704 | 3 | 268 MB | |
+
+405,116 samples over 392,324 images, 3.86 GB. Splitting `pairs` out is not
+tidiness: `pairs-train` is 942 MB of that, and one undivided series would make
+every training epoch read the other 2.9 GB to train on none of it. Shards are pure in split as well
+as role, so a job that globs `pairs-train-*.tar` cannot physically read a val
+pixel — a stronger guarantee than filtering at load time, which is one line away
+from being wrong.
+
+### The packer found a leak the catalog's own checks could not see
+
+Asserting the no-image-in-two-splits invariant on the bytes about to be written,
+rather than on the table they came from, caught **five images heading 57 catalog
+rows (43 of them in `pairs`) that were in two or three splits at once**.
+
+`catalog.main_image_path` is taken straight from the listings and never passes
+through the product-image edge table, so pruning the generic images (the >50
+products cap, above) left those rows pointing at a dropped image — and, because
+the prune also removed the edge that would have unioned those listings into one
+component, the split was assigned to each of them independently. Both existing
+checks read `product_images`, where the offending edges were already gone, so
+both reported zero. The build now drops listings headed by a generic image, for
+the reason already written at the cap: an image on more products than the cap
+cannot be a retrieval target, so a listing headed by one has no valid target at
+all. A third invariant, on `catalog.main_image_id`, closes the class.
+
+Small — 0.04% of rows — and it would have put the same pixels in train and val.
+
+### The split was not reproducible, and no invariant could tell
+
+Chasing the above surfaced a larger one. `assign_splits` keyed each component on
+its union-find **root**, which is whichever member happened to arrive first, and
+the edge list comes out of an unordered DuckDB scan. Rebuilding an unchanged
+archive moved whole components between splits: train +118, val -214, test +39.
+Every leak check passed throughout, because components stayed intact and only
+their labels moved — which is exactly why it went unnoticed, and why
+"reproducible from a clean clone" was false.
+
+The key is now the component's smallest `product_id`, which is a function of the
+graph rather than of the traversal. Two consecutive full builds now produce a
+byte-identical assignment over all 145,614 rows, and a test shuffles the edge
+list 25 ways and demands one answer.
+
+### The pack is byte-reproducible; the first version was not
+
+Two packs of one input are now byte-identical across all 42 shards. The first
+attempt was not, and the way it failed is worth recording: shard count, per-shard
+sample counts and per-shard **sizes** all matched exactly, and only the SHA-256s
+disagreed.
+
+`product_id` is not unique in `pairs` — the same ASIN is listed per marketplace —
+so the sample key carries an occurrence suffix, assigned by `row_number()` over
+(`main_image_id`, `title`). 101 groups of rows tie on that pair, 99 of them
+differing only in `title_lang`, so which row got `-00` was whatever the scan
+happened to return. Every `en_XX` tag is five characters, which is why the sizes
+never moved. The ordering now covers every column that can distinguish two rows,
+and the index sidecars' product arrays are sorted in Python rather than trusting
+a grouped aggregate to keep an order it never promised.
+
+### Sizes are the tar's, not the pixels'
+
+`--shard-bytes` budgets the archive. Every member costs a 512-byte header and is
+padded to a 512-byte boundary, which on 7.4 KB images plus two sidecars is ~31%
+overhead: 2.94 GB of images becomes 3.86 GB of shards. The first version counted
+payload and quietly produced 120 MB shards from a 100 MB budget; both numbers are
+published per series in `manifest.json`, along with a SHA-256 per shard — tar
+headers are written with fixed mtime and ownership, so two packs of one input are
+byte-identical and a run record can cite a shard set by hash.
+
+```bash
+python -m scripts.pack_shards                 # 42 shards, ~30s
+python -m scripts.pack_shards --roles pairs   # training set only, 0.9 GB
+```
+
+---
+
 ## Fetching user-supplied URLs
 
 `src/vislens/fetch/image_fetch.py` is the only code in either repo that dereferences a URL a user
@@ -346,8 +448,9 @@ recall delta published.
 uv venv --python 3.11 && uv pip install -e ".[dev]" && .venv/bin/pytest
 ```
 
-223 tests (62 rules, 72 fetch controls, 30 near-duplicate, 33 service, 23 catalog build),
-~19s, no network and no API key — which is why the whole suite runs in CI on every push.
+239 tests (72 fetch controls, 65 rules, 33 service, 30 near-duplicate, 26 catalog build,
+13 shard packing), ~19s, no network and no API key — which is why the whole suite runs in CI
+on every push.
 Then start the service:
 
 ```bash

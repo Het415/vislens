@@ -102,7 +102,9 @@ def split_for(key: str) -> str:
 
     Hash-based rather than a stored shuffle: order-independent, reproducible
     from a clean clone with no split file to lose, and stable when rows are
-    added later.
+    added later. Order-independence is a property of the *key* as much as the
+    hash — see `assign_splits`, where using the union-find root instead of the
+    component's smallest member quietly made the whole thing order-dependent.
 
     The key is a **connected-component root**, not a product id — see
     `assign_splits` and `GENERIC_IMAGE_MAX_PRODUCTS` for why a product-level key
@@ -145,7 +147,24 @@ def assign_splits(pairs: list[tuple[str, str]]) -> tuple[dict[str, str], dict]:
             if other_root != root:
                 parent[other_root] = root
 
-    assignment = {product: split_for(find(product)) for product in parent}
+    # The component's key is the SMALLEST product id in it, not the union-find
+    # root. The root is whichever member happened to arrive first, so it is a
+    # function of edge order — and the edge list comes out of an unordered
+    # DuckDB scan, which is free to hand back a different order on every run.
+    #
+    # Measured, not theorised: rebuilding an unchanged archive moved whole
+    # components between splits (train +118, val -214, test +39 on the 145K
+    # catalog), and a six-edge graph shuffled twelve ways produced two different
+    # assignments. The no-image-spans-two-splits invariant held throughout —
+    # components stay intact, they just get relabelled — so nothing caught it.
+    # `min()` makes the split a pure function of the graph, which is what the
+    # docstring above has always claimed.
+    members: dict[str, list[str]] = collections.defaultdict(list)
+    for product in parent:
+        members[find(product)].append(product)
+    canonical = {root: min(group) for root, group in members.items()}
+
+    assignment = {product: split_for(canonical[find(product)]) for product in parent}
     sizes = collections.Counter(find(p) for p in parent)
     ordered = sorted(sizes.values(), reverse=True)
     stats = {
@@ -368,6 +387,33 @@ def main() -> None:
     ).fetchone()[0]
     con.execute("DELETE FROM catalog WHERE main_image_path IS NULL")
 
+    # A listing whose MAIN image is one of the generic assets pruned in step 2
+    # has to go too, and the prune above does not do it: `catalog` takes
+    # `main_image_id` straight from `listings`, so it never passes through
+    # `edges` and deleting those edges leaves the column pointing at a dropped
+    # image.
+    #
+    # That was a real leak, not a tidiness point. Five images headed 57 catalog
+    # rows (43 of them in `pairs`) spanning two or three splits each, because
+    # the products they head were never unioned into one component — the prune
+    # had already removed the edge that would have joined them — so the split
+    # was assigned independently on each side and the same pixels landed in
+    # train AND val. Both checks at the end of this function read
+    # `product_images`, where those edges are gone, so both reported zero.
+    #
+    # Dropping rather than re-unioning, for the reason already written at
+    # GENERIC_IMAGE_MAX_PRODUCTS: an image on more products than the cap cannot
+    # be a retrieval target, so a listing headed by one has no valid target at
+    # all. Re-unioning would pull the giant component back, which is the thing
+    # the cap exists to prevent.
+    generic_main = con.execute(
+        "SELECT count(*) FROM catalog "
+        "WHERE main_image_id IN (SELECT image_id FROM generic_images)"
+    ).fetchone()[0]
+    con.execute(
+        "DELETE FROM catalog WHERE main_image_id IN (SELECT image_id FROM generic_images)"
+    )
+
     con.execute(
         f"""
         CREATE TABLE product_images AS
@@ -444,12 +490,28 @@ def main() -> None:
     if image_overlap:
         sys.exit(f"ABORT: {image_overlap} images span more than one split")
 
+    # The third invariant, and the one neither of the above can see: a main
+    # image reaches `catalog` without passing through `edges`, so checking
+    # `product_images` says nothing about it. This is the check that would have
+    # caught the leak described above at the point it was introduced.
+    main_overlap = con.execute(
+        """
+        SELECT count(*) FROM (
+            SELECT main_image_id FROM catalog GROUP BY main_image_id
+            HAVING count(DISTINCT split) > 1
+        )
+        """
+    ).fetchone()[0]
+    if main_overlap:
+        sys.exit(f"ABORT: {main_overlap} main images span more than one split")
+
     report = {
         "built": dt.date.today().isoformat(),
         "subset": args.subset,
         "listings_total": stats.get("listings_total"),
         "dropped_no_main_image": stats.get("dropped_no_main_image", 0),
         "main_image_join_misses": join_misses,
+        "dropped_generic_main_image": generic_main,
         "multi_product_type": stats.get("multi_product_type", 0),
         "counts": counts,
         "en_us_titles": en_us_only,
