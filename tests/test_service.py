@@ -345,14 +345,31 @@ def test_audit_store_is_bounded(client):
 
 
 def test_service_imports_no_llm_client_and_no_torch():
-    """The isolation argument for the split. This process dereferences
-    user-supplied URLs, so it must contain nothing worth reaching."""
+    """The isolation argument for the split: this process dereferences
+    user-supplied URLs, so it must contain nothing worth reaching.
+
+    Checked in a SUBPROCESS, and that is the whole point of the test rather
+    than an implementation detail. The first version inspected `sys.modules`
+    in-process, which is polluted by every other test module in the session —
+    it broke the moment `test_catalog_build.py` imported duckdb, and until then
+    it had been passing for the wrong reason. A global-state assertion about
+    an import graph has to run in a process that imported only the thing under
+    test, or it measures the test runner instead of the service.
+    """
+    import subprocess
     import sys
 
-    import vislens.service.app  # noqa: F401
-
-    for forbidden in ("torch", "groq", "anthropic", "openai", "langchain", "duckdb"):
-        assert forbidden not in sys.modules, f"{forbidden} was imported by the service"
+    forbidden = ("torch", "groq", "anthropic", "openai", "langchain", "duckdb", "pandas")
+    probe = (
+        "import sys, vislens.service.app;"
+        f"bad=[m for m in {forbidden!r} if m in sys.modules];"
+        "print(','.join(bad))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    leaked = result.stdout.strip()
+    assert not leaked, f"the service's import graph pulls in: {leaked}"
 
 
 # ── Near-duplicate detection ──────────────────────────────────────────────────

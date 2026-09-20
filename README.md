@@ -33,6 +33,7 @@ Conventions, and the reasoning behind each: [CLAUDE.md](CLAUDE.md).
 | ListingLens client + agent wiring | **built** — in the sibling repo, 21 tests |
 | ABO `en_US` gate | **measured** — see below |
 | Split-leakage fix | **measured** — 27,554 leaking images → 0 |
+| CI | **built** — ruff + 223 tests, no secrets, no network, no GPU |
 
 Nothing above is claimed in a UI before it is backed by code. That rule exists because the
 predecessor repo shipped a landing page advertising *"CLIP model analyzes your product images for
@@ -345,8 +346,9 @@ recall delta published.
 uv venv --python 3.11 && uv pip install -e ".[dev]" && .venv/bin/pytest
 ```
 
-192 tests (60 rules, 72 fetch controls, 28 near-duplicate, 32 service), ~17s, no network and
-no API key. Then start the service:
+223 tests (62 rules, 72 fetch controls, 30 near-duplicate, 33 service, 23 catalog build),
+~19s, no network and no API key — which is why the whole suite runs in CI on every push.
+Then start the service:
 
 ```bash
 .venv/bin/python -m uvicorn vislens.service.app:app --port 8100
@@ -368,6 +370,31 @@ do not share a venv.
 `torch` lives only in the `train` extra and is never installed into anything that serves a
 request. ListingLens bans it outright: torch plus sentence-transformers cost ~490 MiB RSS *before
 reading a weight* and were OOM-killed under a 512 MB cap.
+
+---
+
+## CI
+
+One job, no secrets, no network, no GPU — and that is a property of the design
+rather than luck. Every check here is deterministic: the compliance rules are
+arithmetic over pixels, the perceptual hashes are fixed functions of the bytes,
+the request-forgery tests reject before connecting, and the catalog build runs
+against a miniature ABO fixture the test writes (the real archives are 83 MB
+and 3 GB).
+
+Contrast the sibling project's judged agent eval, which costs Groq tokens, is
+bounded to roughly one run a day, and carries a ~37% run-to-run noise floor.
+That cannot live in CI. This can, and it means something when it passes.
+
+Two guards beyond lint and tests, both enforcing a rule the repo would
+otherwise only *state*:
+
+- **torch must be absent from a default install.** It belongs to the `train`
+  extra alone. If it appears, the ONNX serving path has silently regained
+  ~490 MiB of import overhead and the reason the sibling project OOM-killed at
+  512 MB is back.
+- **no archives, parquet or weights may be tracked.** Download scripts rebuild
+  everything; a 3 GB archive in git history is not something you undo.
 
 ---
 

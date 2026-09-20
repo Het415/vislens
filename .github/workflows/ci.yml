@@ -1,0 +1,96 @@
+# ── vislens CI ────────────────────────────────────────────────────────────────
+# One job, and it needs no secrets, no network and no GPU. That is a property
+# of the design rather than a happy accident, and it is worth stating because
+# the sibling project's benchmark is the opposite: its judged eval costs Groq
+# tokens, is bounded to roughly one run a day, and carries a ~37% run-to-run
+# noise floor, so it cannot live in CI at all.
+#
+# Everything here is deterministic:
+#   - the compliance checks are arithmetic over pixels
+#   - the near-duplicate hashes are fixed functions of the bytes
+#   - the request-forgery tests reject before connecting, and the one case that
+#     needs a hostile DNS answer patches the resolver seam
+#   - the catalog build runs against a miniature ABO fixture the test writes,
+#     because the real archives are 83 MB and 3 GB and CI has neither
+#
+# So this suite is safe to run on every push and it means something when it
+# passes. ~200 tests in under 30 seconds.
+#
+# Deliberately NOT here:
+#   - the near-duplicate calibration (needs real downloaded product images; its
+#     output is a committed dated report, and a test asserts the shipped
+#     threshold matches it)
+#   - any training (needs a GPU; see CLAUDE.md on Kaggle)
+#   - a Docker build (there is no deployment — this is a benchmark repo plus a
+#     small service, and a p99 without a workload would be a number we invented)
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref — no reason to pay for a run whose
+# commit has already been replaced.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint + tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # 3.11 matches Kaggle's GPU runtime, which is what the training half
+          # has to import cleanly under. Not the sibling project's 3.13.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # --prefer-binary matters: faiss-cpu, onnxruntime and scipy all have
+          # sdists that take many minutes to compile and wheels that take
+          # seconds. The sibling project learned this on its own Docker builds.
+          pip install --prefer-binary -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check src tests scripts
+
+      - name: Pytest
+        run: pytest -q
+
+      - name: Confirm torch never reached a serving path
+        # The load-bearing constraint of this whole repo: torch belongs to the
+        # `train` extra only. If it turns up in a default install, the ONNX
+        # serving path has silently regained ~490 MiB of import overhead and
+        # the reason the sibling project OOM-killed at 512 MB is back.
+        run: |
+          if pip show torch > /dev/null 2>&1; then
+            echo "::error::torch is installed by the default dependency set."
+            echo "It belongs in the [train] extra only — see CLAUDE.md section 2."
+            exit 1
+          fi
+          echo "torch absent from the serving install, as intended"
+
+      - name: Confirm no data or weights are tracked
+        # The no-committed-data rule, enforced rather than trusted. Download
+        # scripts rebuild everything; a 3 GB archive in git history is not
+        # something you undo.
+        run: |
+          offenders=$(git ls-files | grep -E '\.(tar|parquet|onnx|pt|pth|npy)$' || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::data or model artifacts are tracked:"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "no archives, parquet or weights tracked"

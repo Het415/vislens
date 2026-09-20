@@ -38,6 +38,7 @@ import datetime as dt
 import gzip
 import hashlib
 import json
+import os
 import pathlib
 import sys
 
@@ -45,9 +46,16 @@ import duckdb
 import pandas as pd
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-ABO = ROOT / "data" / "abo"
-OUT = ROOT / "data" / "catalog"
-DOCS = ROOT / "docs"
+
+# Overridable so the test suite can point the whole pipeline at synthetic
+# fixtures. CI has no ABO archives — the listings tar is 83 MB and the image
+# metadata lives inside a 3 GB tar — so the end-to-end build test constructs a
+# miniature ABO layout instead. That is the right thing to test anyway: the
+# logic worth guarding is the join, the language ladder and the split, none of
+# which need 147K real rows to exercise.
+ABO = pathlib.Path(os.getenv("VISLENS_ABO_DIR", ROOT / "data" / "abo"))
+OUT = pathlib.Path(os.getenv("VISLENS_CATALOG_DIR", ROOT / "data" / "catalog"))
+DOCS = pathlib.Path(os.getenv("VISLENS_DOCS_DIR", ROOT / "docs"))
 
 # Ordered preference. `en_US` first, then the rest of the English locales by
 # rough corpus size. `title_lang` records which one supplied each row, so the
@@ -468,6 +476,9 @@ def main() -> None:
 def render_data_card(r: dict) -> str:
     langs = "\n".join(f"| `{tag}` | {count:,} |" for tag, count in r["title_langs"][:12])
     splits = " · ".join(f"{s}: {c:,}" for s, c in r["splits"])
+    components = r.get("component_components", 0)
+    largest = r.get("component_largest_component", 0)
+    largest_share = r.get("component_largest_component_share", 0.0)
     return f"""# Data card — Amazon Berkeley Objects
 
 Built {r['built']}{" (SUBSET: " + str(r['subset']) + " listings)" if r['subset'] else ""} by
@@ -510,11 +521,23 @@ choice is ablatable instead of baked in.
 
 {splits}
 
-Assigned by `sha1(product_id) % 10` — order-independent, reproducible from a
-clean clone with no split file to lose, and stable when rows are added. **Split
-by product, never by image**: a product's five photos all land in one split, or
-every retrieval number is inflated. The build aborts if any product spans more
-than one split, and `tests/test_split_leakage.py` asserts the same property.
+Assigned by `sha1(component_root) % 10` — order-independent, reproducible from
+a clean clone with no split file to lose, and stable when rows are added.
+
+**Split by product, never by image — and that is not sufficient here.** A
+product's photos must all land in one split or every retrieval number is
+inflated, but on this dataset the same photo appears under several marketplace
+listings, so two *different* products can hold byte-identical pixels. Splitting
+by `product_id` alone left **27,554 images spanning two splits, touching 40.3%
+of rows**, while passing its own check.
+
+So the split key is a **connected component** of the product-image graph: two
+products sharing any image land together. {components:,} components, largest
+{largest:,} ({largest_share:.1%}).
+
+The build **aborts** if any product *or any image* spans more than one split,
+and `tests/test_catalog_build.py` asserts both invariants against a miniature
+ABO fixture.
 
 ## Quirks worth knowing
 

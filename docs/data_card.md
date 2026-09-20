@@ -44,13 +44,25 @@ choice is ablatable instead of baked in.
 
 ## Splits
 
-test: 14,283 · train: 114,587 · val: 16,801
+test: 14,616 · train: 116,992 · val: 14,063
 
-Assigned by `sha1(product_id) % 10` — order-independent, reproducible from a
-clean clone with no split file to lose, and stable when rows are added. **Split
-by product, never by image**: a product's five photos all land in one split, or
-every retrieval number is inflated. The build aborts if any product spans more
-than one split, and `tests/test_split_leakage.py` asserts the same property.
+Assigned by `sha1(component_root) % 10` — order-independent, reproducible from
+a clean clone with no split file to lose, and stable when rows are added.
+
+**Split by product, never by image — and that is not sufficient here.** A
+product's photos must all land in one split or every retrieval number is
+inflated, but on this dataset the same photo appears under several marketplace
+listings, so two *different* products can hold byte-identical pixels. Splitting
+by `product_id` alone left **27,554 images spanning two splits, touching 40.3%
+of rows**, while passing its own check.
+
+So the split key is a **connected component** of the product-image graph: two
+products sharing any image land together. 105,854 components, largest
+2,738 (1.9%).
+
+The build **aborts** if any product *or any image* spans more than one split,
+and `tests/test_catalog_build.py` asserts both invariants against a miniature
+ABO fixture.
 
 ## Quirks worth knowing
 
