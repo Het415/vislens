@@ -13,6 +13,29 @@ readme = "README.md"
 # this mistake. ListingLens stays on 3.13; the two repos do not share a venv.
 requires-python = ">=3.11,<3.12"
 
+# What a request can actually reach, and nothing else.
+#
+# Measured, not assumed: importing `vislens.service.app` in a subprocess loads
+# PIL, numpy and scipy — and does NOT load onnxruntime, faiss, duckdb, pyarrow
+# or pandas. Those five sat in this list anyway, so a `pip install` for serving
+# paid for all of them: 426 MB of site-packages where 118 MB serves every
+# request (fresh installs, `du` before byte-compilation, macOS arm64 wheels —
+# Linux differs in the details, not in the conclusion). pyarrow alone was
+# 122 MB of the waste, onnxruntime 75 MB, duckdb 44 MB, pandas 40 MB, faiss
+# 17 MB, and their transitive tail the remaining 10. Four of the five moved to
+# an extra below; pyarrow turned out to be imported by nothing at all and was
+# dropped outright.
+#
+# The cap that makes this worth splitting: the audit service targets a 512 MB
+# Render free instance, and the sibling ListingLens repo is the cautionary
+# tale — it peaks at 469.8 / 512 MiB with ~42 MiB of headroom, and it was
+# OOM-killed for carrying a dependency it never served from. A serving install
+# that ships the catalog build's toolchain is that same mistake wearing a
+# different package name.
+#
+# So the rule for this list is narrow: a package belongs here only if an HTTP
+# request can reach it. Everything else is an extra below, and CI enforces the
+# split in both directions rather than trusting this comment — see ci.yml.
 dependencies = [
     # Image rules. Pillow does the decode; scipy.ndimage does the morphology.
     # Deliberately NO opencv: the only operations needed are label/binary_closing/
@@ -21,21 +44,55 @@ dependencies = [
     "pillow>=11,<13",
     "numpy>=2.1,<3",
     "scipy>=1.11,<2",
-    # Catalog build. DuckDB, not Spark — see CLAUDE.md. The ABO listings are
-    # 83 MB of gzipped JSON, which is one DuckDB query.
-    "duckdb>=1.1,<2",
-    "pyarrow>=17",
-    "pandas>=2.2,<3",
-    # Serving. onnxruntime only, never torch, in anything that serves.
+    # Serving. No onnxruntime here yet, and never torch — see the `bench` extra
+    # for why the encoder that would need it does not exist.
     "fastapi>=0.115,<1",
     "uvicorn>=0.32,<1",
     "python-multipart>=0.0.12",
-    "onnxruntime>=1.20,<2",
-    "faiss-cpu>=1.13,<2",
     "requests>=2.32,<3",
 ]
 
 [project.optional-dependencies]
+# Catalog build and shard packing: `scripts/build_catalog.py` and
+# `scripts/pack_shards.py`. Both are offline, run by hand, and never touched by
+# a request. DuckDB, not Spark — see CLAUDE.md; the ABO listings are 83 MB of
+# gzipped JSON, which is one DuckDB query.
+#
+# pyarrow is deliberately NOT here, having been the largest single package in
+# the old default set at 122 MB. Nothing imports it, no call site reaches for
+# arrow interchange (`to_parquet`, `read_parquet`, `fetch_arrow_table`), and the
+# 40 catalog/packing tests pass without it — DuckDB's parquet COPY and its
+# pandas replacement scan are both native C++, and pandas treats pyarrow as
+# optional. Declaring it "for when the eval harness wants `read_parquet`" is how
+# a 122 MB speculative dependency gets in; add it back in the commit that
+# actually calls arrow, and the CI guard will stop it reaching serving either
+# way.
+#
+# The test suite needs this extra — tests/test_catalog_build.py and
+# tests/test_pack_shards.py both import duckdb — which is why CI and the README
+# install `.[dev,data]` and not `.[dev]`.
+data = [
+    "duckdb>=1.1,<2",
+    "pandas>=2.2,<3",
+]
+# The retrieval benchmark: run the exported encoder over a six-figure corpus
+# (onnxruntime) and search it (faiss). Neither package is imported anywhere in
+# src, tests or scripts today, and that is a finding rather than an oversight —
+# the build plan pre-committed to shipping hashing alone if it matched a CLIP
+# embedding, `dhash` @ ≤8 held out at P 1.000 / R 0.989, and so the
+# near-duplicate encoder was never justified (README, "What this means for the
+# model tier"). Exact all-pairs over 3-12 user-supplied images wants no index
+# either.
+#
+# onnxruntime returns to `dependencies` the day the semantic checks (text
+# overlay, image role) come off the bench — they are specified-and-disabled,
+# gated on measured agreement, and they run as local ONNX. That is the one
+# readmission this file expects, and CLAUDE.md section 2 survives it intact:
+# when a serving encoder exists it is onnxruntime, never torch.
+bench = [
+    "onnxruntime>=1.20,<2",
+    "faiss-cpu>=1.13,<2",
+]
 # Training only. This is the ONLY place torch is allowed to appear in either
 # repo, and it is never installed into anything that serves a request.
 train = [

@@ -35,7 +35,7 @@ Conventions, and the reasoning behind each: [CLAUDE.md](CLAUDE.md).
 | ABO `en_US` gate | **measured** — see below |
 | Split-leakage fix | **measured** — 27,554 leaking images → 0, then 5 more the packer caught |
 | Split reproducibility | **measured** — two builds, one byte-identical assignment |
-| CI | **built** — ruff + 239 tests, no secrets, no network, no GPU |
+| CI | **built** — ruff + 240 tests, no secrets, no network, no GPU |
 
 Nothing above is claimed in a UI before it is backed by code. That rule exists because the
 predecessor repo shipped a landing page advertising *"CLIP model analyzes your product images for
@@ -445,11 +445,11 @@ recall delta published.
 ## Run it
 
 ```bash
-uv venv --python 3.11 && uv pip install -e ".[dev]" && .venv/bin/pytest
+uv venv --python 3.11 && uv pip install -e ".[dev,data]" && .venv/bin/pytest
 ```
 
-239 tests (72 fetch controls, 65 rules, 33 service, 30 near-duplicate, 26 catalog build,
-13 shard packing), ~19s, no network and no API key — which is why the whole suite runs in CI
+240 tests (72 fetch controls, 65 rules, 33 service, 30 near-duplicate, 26 catalog build,
+14 shard packing), ~19s, no network and no API key — which is why the whole suite runs in CI
 on every push.
 Then start the service:
 
@@ -470,6 +470,30 @@ claimed as verdicts.
 Python is pinned to **3.11** to match Kaggle's GPU runtime — not ListingLens' 3.13. The two repos
 do not share a venv.
 
+The `data` extra is what the suite needs beyond `dev` — the catalog-build and shard-packing
+tests import DuckDB. **Serving needs no extras at all**, and that is the point of how the
+dependencies are split:
+
+| Install | site-packages | What it is for |
+|---|---|---|
+| `pip install .` | **118 MB** | The audit service — pillow, numpy, scipy, fastapi, uvicorn, requests |
+| `.[data]` | 208 MB | Catalog build and shard packing — duckdb, pandas |
+| `.[bench]` | 212 MB | The retrieval benchmark — onnxruntime, faiss. Nothing imports either yet |
+| `.[train]` | — | torch, on Kaggle only. Never a serving path |
+
+Five packages used to sit in the default set, so an install for serving fetched **426 MB** to run
+a request path that loads PIL, numpy and scipy and nothing else — measured by importing
+`vislens.service.app` in a subprocess and reading `sys.modules`, which is how the split was
+derived. Four of them moved to the extras above. The fifth, **pyarrow, was dropped outright**: at
+122 MB it was the largest single package in the repo, and nothing imports it — DuckDB's parquet
+`COPY` and its pandas replacement scan are both native C++, pandas treats pyarrow as optional, and
+the 40 catalog and packing tests pass without it.
+
+That is 308 MB off a serving install, against a 512 MB instance, and CI asserts both halves of the
+claim: the heavy five stay out, and what remains still imports the service. (Sizes are `du` on a
+fresh install before byte-compilation, macOS arm64 wheels; Linux differs in the details, not the
+conclusion.)
+
 `torch` lives only in the `train` extra and is never installed into anything that serves a
 request. ListingLens bans it outright: torch plus sentence-transformers cost ~490 MiB RSS *before
 reading a weight* and were OOM-killed under a 512 MB cap.
@@ -489,13 +513,20 @@ Contrast the sibling project's judged agent eval, which costs Groq tokens, is
 bounded to roughly one run a day, and carries a ~37% run-to-run noise floor.
 That cannot live in CI. This can, and it means something when it passes.
 
-Two guards beyond lint and tests, both enforcing a rule the repo would
+Three guards beyond lint and tests, each enforcing a rule the repo would
 otherwise only *state*:
 
 - **torch must be absent from a default install.** It belongs to the `train`
   extra alone. If it appears, the ONNX serving path has silently regained
   ~490 MiB of import overhead and the reason the sibling project OOM-killed at
   512 MB is back.
+- **a serving install must stay small, and must still work.** A second job
+  installs the default set with no extras and asserts both directions: none of
+  torch, onnxruntime, faiss, duckdb, pyarrow or pandas is present, *and*
+  `vislens.service.app` imports on what is left, loading nothing heavier than
+  PIL, numpy and scipy. The test job cannot make that assertion — it installs
+  `.[dev,data]`, so duckdb is legitimately on its path and it has no way to
+  tell a serving dependency from its own. Only a clean install can.
 - **no archives, parquet or weights may be tracked.** Download scripts rebuild
   everything; a 3 GB archive in git history is not something you undo.
 

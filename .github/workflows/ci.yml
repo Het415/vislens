@@ -58,10 +58,16 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          # --prefer-binary matters: faiss-cpu, onnxruntime and scipy all have
-          # sdists that take many minutes to compile and wheels that take
-          # seconds. The sibling project learned this on its own Docker builds.
-          pip install --prefer-binary -e ".[dev]"
+          # --prefer-binary matters: scipy, duckdb and pandas all have sdists
+          # that take many minutes to compile and wheels that take seconds. The
+          # sibling project learned this on its own Docker builds.
+          #
+          # `data` is not optional for the suite even though it is optional for
+          # serving: test_catalog_build.py and test_pack_shards.py import
+          # duckdb. `bench` is deliberately absent — nothing imports
+          # onnxruntime or faiss yet, so installing them here would only hide
+          # the day something starts to.
+          pip install --prefer-binary -e ".[dev,data]"
 
       - name: Ruff
         run: ruff check src tests scripts
@@ -74,13 +80,19 @@ jobs:
         # `train` extra only. If it turns up in a default install, the ONNX
         # serving path has silently regained ~490 MiB of import overhead and
         # the reason the sibling project OOM-killed at 512 MB is back.
+        #
+        # This job installs `.[dev,data]`, so it can only speak for torch and
+        # the `bench` extra. The full serving set is asserted by the `serving`
+        # job below, which installs no extras at all.
         run: |
-          if pip show torch > /dev/null 2>&1; then
-            echo "::error::torch is installed by the default dependency set."
-            echo "It belongs in the [train] extra only — see CLAUDE.md section 2."
-            exit 1
-          fi
-          echo "torch absent from the serving install, as intended"
+          for pkg in torch onnxruntime faiss-cpu; do
+            if pip show "$pkg" > /dev/null 2>&1; then
+              echo "::error::$pkg is installed by the default dependency set."
+              echo "torch belongs to [train] and onnxruntime/faiss-cpu to [bench] — see CLAUDE.md section 2."
+              exit 1
+            fi
+          done
+          echo "torch, onnxruntime and faiss absent from the test install, as intended"
 
       - name: Confirm no data or weights are tracked
         # The no-committed-data rule, enforced rather than trusted. Download
@@ -94,3 +106,76 @@ jobs:
             exit 1
           fi
           echo "no archives, parquet or weights tracked"
+
+  serving:
+    name: Serving install stays small
+    runs-on: ubuntu-latest
+
+    # The dependency split is only real if something checks it. This job
+    # installs the default set — no extras — and asserts both directions:
+    # nothing heavy sneaks back into `[project].dependencies`, and the small set
+    # left behind is genuinely enough to import the service.
+    #
+    # Worth a second job rather than a step in the first: the test job needs
+    # `.[dev,data]`, so it physically cannot tell whether duckdb and pandas are
+    # in the serving set or merely in its own. Only a clean install can. It
+    # costs ~20s, no secrets and no network beyond PyPI.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the default set only
+        run: |
+          python -m pip install --upgrade pip
+          pip install --prefer-binary .
+
+      - name: Confirm no build-or-bench dependency is in the serving set
+        # These five cost 308 MB of the 426 MB the default set used to install,
+        # against a 512 MB Render free instance, and the request path reaches
+        # none of them. onnxruntime is expected back here the day the semantic
+        # checks ship; until then its absence is the invariant. pyarrow is in
+        # this list while being declared by no extra at all — it is imported
+        # nowhere, so anything that reinstates it should have to say why.
+        run: |
+          failed=0
+          for pkg in torch onnxruntime faiss-cpu duckdb pyarrow pandas; do
+            if pip show "$pkg" > /dev/null 2>&1; then
+              echo "::error::$pkg reached the default (serving) dependency set."
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "Move it to [data], [bench] or [train] — or, for pyarrow, justify it first."
+            echo "See the comments in pyproject.toml."
+            exit 1
+          fi
+          echo "serving install carries none of torch/onnxruntime/faiss/duckdb/pyarrow/pandas"
+
+      - name: Confirm the serving set is sufficient, and loads nothing heavy
+        # The measurement the split was derived from, kept as a regression
+        # test: importing the app pulls PIL, numpy and scipy and stops there.
+        # If a future import of pandas lands in a module the service reaches,
+        # this fails here instead of at 512 MB on a live instance.
+        run: |
+          python - <<'PY'
+          import sys
+
+          import vislens.service.app  # noqa: F401  (imported for its side effects)
+
+          heavy = ["torch", "onnxruntime", "faiss", "duckdb", "pyarrow", "pandas"]
+          leaked = [name for name in heavy if name in sys.modules]
+          if leaked:
+              sys.exit(f"::error::vislens.service.app imported {', '.join(leaked)}")
+
+          for name in ["PIL", "numpy", "scipy"]:
+              assert name in sys.modules, f"{name} unexpectedly absent"
+
+          print("service imports cleanly on the serving set: PIL, numpy, scipy only")
+          PY
