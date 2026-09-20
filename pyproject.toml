@@ -49,6 +49,11 @@ dev = [
     "pytest>=8",
     "pytest-cov>=5",
     "ruff>=0.7",
+    # starlette's TestClient needs an HTTP client, and current starlette wants
+    # httpx2 specifically (it deprecates plain httpx). Declared rather than
+    # assumed: this was installed ad hoc during development and CI caught the
+    # omission on the first run, which is the whole point of having CI.
+    "httpx2>=2.13",
 ]
 
 [build-system]
@@ -61,12 +66,6 @@ packages = ["src/vislens"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
-filterwarnings = [
-    # starlette's TestClient warns that httpx is deprecated in favour of httpx2.
-    # Test-harness noise, not our code.
-    "ignore::DeprecationWarning:starlette.*",
-    "ignore:Using `httpx` with `starlette.testclient`:",
-]
 
 [tool.ruff]
 line-length = 100
