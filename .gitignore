@@ -1,0 +1,35 @@
+# Data and weights are never committed. Download scripts rebuild them; model
+# artifacts ship as GitHub Release assets. See CLAUDE.md.
+data/abo/
+data/shards/
+data/abo/
+data/catalog/
+data/near_dup_set/
+data/*.parquet
+data/*.npy
+*.tar
+*.onnx
+*.pt
+*.pth
+*.joblib
+
+# The exception: rule thresholds ARE committed. They are configuration with a
+# provenance record, not derived data, and the eval report has to be able to
+# name the exact thresholds it measured.
+!data/image_rules/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Eval reports ARE committed (dated markdown + jsonl). Scratch output is not.
+eval/scratch/
+
+# macOS
+.DS_Store

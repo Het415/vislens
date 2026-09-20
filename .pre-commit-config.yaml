@@ -1,0 +1,36 @@
+# Secret-scanning guard rail.
+#
+# Blocks any commit that contains an API key, token, or private key before it
+# can leave your machine. The repo is currently clean — this just keeps it that
+# way (defense-in-depth alongside GitHub push protection).
+#
+# One-time setup (macOS):
+#   brew install pre-commit gitleaks
+#   pre-commit install
+#
+# After that, gitleaks runs automatically on every `git commit` and scans only
+# the staged changes. To scan the whole tree on demand:
+#   pre-commit run --all-files
+# If it false-positives on review text in data/*.csv, record the path or
+# fingerprint in a `.gitleaksignore` file.
+#
+# ── Note on ruff, below ──
+# ListingLens runs gitleaks ONLY. Ruff is a NEW convention in this repo, not one
+# carried over — the build spec claimed it was already a house rule and it was
+# not. Recorded here so nobody "restores consistency" by deleting it.
+
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (detect hardcoded secrets)
+        entry: gitleaks protect --staged --redact --verbose
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

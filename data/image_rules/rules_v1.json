@@ -1,0 +1,141 @@
+{
+  "rules_version": "v1",
+  "verified_against": "Amazon Seller Central product image requirements",
+  "verified_on": "2026-09-20",
+  "_note": "Thresholds live here, not in code, so the number the UI shows and the number the eval measures cannot drift. A threshold change is a dated, reviewable diff. `tier` drives how the UI renders a check: rule_exact = arithmetic on metadata and cannot be wrong; measured = pixel statistics with published precision/recall; advisory = a signal, explicitly not a verdict.",
+  "decode": {
+    "max_pixels": 50000000,
+    "work_longest_side": 1024,
+    "max_bytes": 8388608
+  },
+  "checks": {
+    "resolution_and_format": {
+      "tier": "rule_exact",
+      "zoom_min_longest_side": 1000,
+      "accepted_min_longest_side": 500,
+      "max_longest_side": 10000,
+      "accepted_formats": [
+        "JPEG",
+        "PNG",
+        "TIFF",
+        "GIF",
+        "WEBP"
+      ],
+      "accepted_modes": [
+        "RGB",
+        "L",
+        "CMYK",
+        "RGBA",
+        "P"
+      ]
+    },
+    "aspect_ratio": {
+      "tier": "advisory",
+      "recommended_ratio": 1.0,
+      "note_delta": 0.25,
+      "_why_advisory": "Amazon has no hard main-image aspect-ratio requirement for most categories; square is a recommendation. Emitting pass/fail here would be a fabricated verdict with arithmetic behind it."
+    },
+    "image_count": {
+      "tier": "rule_exact",
+      "recommended_min": 6,
+      "typical_cap": 9,
+      "_why_phrasing_matters": "This check sees only the images handed to it, so it reports n_images_supplied and says 'you supplied N', never 'your listing has N'. The cap is category-dependent, which is what the old hardcoded 'Image count (only 3, need 7+)' stub got wrong."
+    },
+    "white_background": {
+      "tier": "measured",
+      "border_band_frac": 0.02,
+      "border_band_min_px": 2,
+      "exact_white_pass_frac": 0.99,
+      "near_white_min_channel": 240,
+      "near_white_max_spread": 8,
+      "near_white_pass_frac": 0.99,
+      "modal_white_passes": true,
+      "max_band_product_frac": 0.9,
+      "ring_bbox_coverage_frac": 0.95,
+      "ring_max_area_frac": 0.15,
+      "_why_two_statistics": "exact_white_frac is the rule (pure white). near_white_frac with a neutrality term (max-min channel spread) catches a faint cream or blue-grey cast that a luminance-only test passes. Reporting the modal RGB lets the user see '(248,248,248), not (255,255,255)' instead of just a failure.",
+      "_why_min_channel_is_240": "Not 250. At 250 an off-white 248 background reads as FOREGROUND, which both makes the warn path unreachable and corrupts the product mask. 240 is the standard band and still rejects a 230 grey.",
+      "_why_max_band_product_frac": "Caps the product-exclusion. Excluding border pixels that belong to a component reaching the centre stops a wide compliant product from reading as a dirty background - but with a genuinely grey or coloured background the WHOLE image is one non-white component reaching the centre, so exclusion claims the entire band and leaves nothing to measure. Past this cap the premise no longer holds: a non-white region covering essentially the whole border is far better explained by a non-white background, so the raw band is measured instead and the check can fail as it should.",
+      "_why_modal_white_passes": "A JPEG-compressed pure-white background has few EXACTLY-255 pixels near product edges because of ringing, so exact_white_frac alone false-warns on a compliant image. If the modal colour is (255,255,255) and essentially every band pixel is near-white, it is a white background with compression noise, and that passes."
+    },
+    "frame_occupancy": {
+      "tier": "measured",
+      "min_bbox_occupancy": 0.85,
+      "component_min_area_frac": 0.0005,
+      "multi_component_area_frac": 0.01,
+      "gradient_fallback_max_mask_frac": 0.02,
+      "gradient_threshold": 12,
+      "_why_bbox_not_silhouette": "Amazon's '85% of the frame' is conventionally the product's bounding box, not its silhouette area. A pair of earbuds fills ~40% of its own bbox, so a silhouette reading fails nearly every compliant listing. bbox_occupancy is the verdict; silhouette_occupancy is reported beside it so a reader can check the interpretation instead of trusting it."
+    },
+    "background_artifacts": {
+      "tier": "measured",
+      "min_component_area_frac": 0.0005,
+      "central_region_frac": 0.5,
+      "corner_region_frac": 0.25,
+      "_why_this_replaces_text_detection": "The rule is that the background must be pure white, so any connected non-white component on the background that is not the product is a violation regardless of what it is - badge, watermark, border, starburst, prop. The check never has to classify the artifact, which is why its precision is high."
+    },
+    "off_product_text": {
+      "tier": "model",
+      "enabled": false,
+      "runtime": "local-onnx",
+      "detector": "PaddlePaddle/PP-OCRv6_medium_det_onnx",
+      "detector_size_mb": 62,
+      "detector_license": "apache-2.0",
+      "promote_at_agreement": 0.9,
+      "_how_it_works": "Local ONNX text DETECTION only - no recognition, no VLM, no API. The detector returns boxes; the semantic question ('did the seller overlay this text, or is it printed on the product?') then reduces to GEOMETRY against the background mask this module already computes: centroid in the background mask = overlaid violation; centroid in the product mask = printed on the product and allowed; overlapping the product but extending well past it = banner. So the check that looked like it needed a VLM needs a 62 MB detector plus a rule we already have.",
+      "_why_not_a_vlm": "A hosted VLM would forfeit determinism, which is the whole reason the rest of this module is computed rather than judged. A pinned local ONNX model is deterministic given its input, so the compliance eval stays repeatable, CI-runnable, secret-free and free of a noise floor. It also costs nothing per call and consumes no LLM rate limit.",
+      "_known_gap": "Text overlaid ON TOP of the product region reads as printed-on-product under the geometric rule. Mitigated partially by the banner heuristic. Measure this case separately in the eval rather than claiming it is handled."
+    },
+    "image_role": {
+      "tier": "model",
+      "enabled": false,
+      "runtime": "local-onnx",
+      "encoder": "clip-vit-base-patch32 vision tower (int8, exported here)",
+      "roles": [
+        "main_product",
+        "lifestyle",
+        "infographic",
+        "size_chart",
+        "packaging",
+        "detail"
+      ],
+      "promote_at_agreement": 0.85,
+      "_how_it_works": "CLIP zero-shot against fixed role prompts. The prompt text embeddings are PRECOMPUTED OFFLINE once and shipped as a small .npy, so the runtime needs only the vision tower - which is already required for near-duplicate detection. Zero additional model at serving time.",
+      "_why_this_is_free": "Category-level semantics is what CLIP is actually good at, unlike instance identity. And because the prompts are fixed, no text encoder ships."
+    },
+    "prohibited_content": {
+      "tier": "model",
+      "enabled": false,
+      "runtime": "local-onnx",
+      "scope": "narrow",
+      "narrow_signals": [
+        "person_present",
+        "multiple_distinct_objects"
+      ],
+      "promote_at_agreement": 0.9,
+      "_honest_limitation": "This is the one semantic check a local model does NOT do well. 'Props or accessories not included in the purchase' requires knowing what the purchase includes, and competitor-logo detection needs a logo dataset. Only the two narrow signals above are attemptable via CLIP zero-shot. The full check is NOT claimed - it stays out of scope until there is either labeled data or a measured reason to add a hosted VLM."
+    }
+  },
+  "_tiers": {
+    "rule_exact": "Arithmetic on image metadata. Cannot be wrong. Drives the headline.",
+    "measured": "A pixel statistic with published precision/recall. Drives the headline.",
+    "advisory": "A signal that is explicitly not a verdict. Never drives the headline.",
+    "model": "A learned-model judgement. Reported and labelled, shipped with its measured agreement against hand labels, and NEVER drives the headline or overrides a computed verdict - the same guard that keeps aspect_ratio from turning a compliant listing red. All model checks run as LOCAL pinned ONNX, so they stay deterministic and the eval stays repeatable; a hosted model would forfeit exactly the property that motivated computing the rest.",
+    "deferred": "Specified but not shipped."
+  },
+  "_model_runtime_gate": {
+    "measure_before_enabling": "RSS delta of the loaded ONNX sessions inside the service container, against its 512 MB cap. Weights are only part of it - the onnxruntime arena does not reliably return memory to the OS, and the failure signal is a silent exit 137.",
+    "clip_vision_fp32_mb": 352,
+    "clip_vision_fp16_mb": 176,
+    "note": "No off-the-shelf int8 vision-only export exists in Xenova/clip-vit-base-patch32; quantize_dynamic it here and publish the measured recall delta. Verify the upstream license (openai/clip-vit-base-patch32 is MIT; the Xenova mirror does not declare one)."
+  },
+  "main_image_only": {
+    "checks": [
+      "white_background",
+      "frame_occupancy",
+      "background_artifacts"
+    ],
+    "_why": "Amazon's pure-white background, 85% frame occupancy, and no-marks-on-the-background requirements apply to the MAIN image only. Secondary images are explicitly permitted lifestyle backgrounds, props, in-use scenes, text and graphics. Applying these three as verdicts to every image in a set would fail a seller's perfectly compliant lifestyle photo against a rule that does not govern it - wrong more often than right on any real listing, which is exactly the failure this module is arranged to prevent.",
+    "_when_role_is_unknown": "Downgraded to advisory, not silently applied and not silently dropped. The measurement is still reported - it is useful - but it is not a claim. The scraped-page path cannot identify which image is the main one, so it always lands here."
+  }
+}
