@@ -135,7 +135,10 @@ thing by default, so this has to be explicit in the code and not only in the REA
 
 Download scripts plus `.gitignore`. Model artifacts ship as GitHub Release assets.
 
-The one exception, and it is deliberate: `data/image_rules/rules_v1.json` **is** committed. Rule
+The one exception, and it is deliberate: `src/vislens/rules/rules_v1.json` and its sibling
+`thresholds_v1.json` **are** committed, and they live inside the package rather than under
+`data/` so a wheel carries them (2026-09-21: a `pip install .` without them imported fine and
+then raised `FileNotFoundError` on the first request). Rule
 thresholds are configuration with a provenance record (`verified_against`, `verified_on`), not
 derived data, and the eval report has to be able to name the exact thresholds it measured. A
 threshold change is a dated, reviewable diff.

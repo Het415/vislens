@@ -22,7 +22,7 @@ Design rules, and the reasons they exist:
     downscaled copy, and the output says so.** A verdict computed at 1024px on a
     4000px original is honest only if it declares the downscale factor.
 
-4.  **Thresholds come from `data/image_rules/rules_v1.json`, never from
+4.  **Thresholds come from `rules_v1.json`, shipped beside this module, never from
     literals here.** The number the UI shows and the number the eval measures
     have to be the same number.
 """
@@ -34,6 +34,7 @@ import io
 import json
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
@@ -50,7 +51,17 @@ Status = Literal["pass", "warn", "fail", "skipped"]
 # eat the 8000 TPM the planner and synthesizer contend for.
 Tier = Literal["rule_exact", "measured", "advisory", "model", "deferred"]
 
-_RULES_PATH = Path(__file__).resolve().parents[3] / "data" / "image_rules" / "rules_v1.json"
+# Shipped as PACKAGE DATA, deliberately, and read through `importlib.resources`
+# rather than a path relative to `__file__`.
+#
+# The previous form was `Path(__file__).resolve().parents[3] / "data" / ...`,
+# which is the repo root from a source checkout and the interpreter's
+# `lib/python3.11` directory from site-packages. Measured: the wheel carried 17
+# entries and no data files, so `pip install .` produced a service that imported
+# cleanly and then raised FileNotFoundError on its first request. `importlib`
+# resolves identically either way, which is the whole point — and it is why
+# `render.yaml` no longer has to pin an editable install to stay alive.
+RULES_RESOURCE = "rules_v1.json"
 
 
 @lru_cache(maxsize=4)
@@ -60,9 +71,10 @@ def load_rules(path: str | None = None) -> dict[str, Any]:
     Cached because a batch audit of nine images would otherwise re-read and
     re-parse the same JSON nine times.
     """
-    p = Path(path) if path else _RULES_PATH
-    with open(p) as f:
-        return json.load(f)
+    if path:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    resource = resources.files("vislens.rules").joinpath(RULES_RESOURCE)
+    return json.loads(resource.read_text(encoding="utf-8"))
 
 
 # ── Results ───────────────────────────────────────────────────────────────────

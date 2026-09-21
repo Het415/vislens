@@ -13,10 +13,11 @@ data/*.npy
 *.pth
 *.joblib
 
-# The exception: rule thresholds ARE committed. They are configuration with a
-# provenance record, not derived data, and the eval report has to be able to
-# name the exact thresholds it measured.
-!data/image_rules/*.json
+# Rule thresholds ARE committed — they are configuration with a provenance
+# record, not derived data, and the eval report has to be able to name the exact
+# thresholds it measured. They no longer need an exception here, because as of
+# 2026-09-21 they live inside the package (`src/vislens/rules/rules_v1.json` and
+# `thresholds_v1.json`) rather than under `data/`, so that a wheel carries them.
 
 # Python
 __pycache__/

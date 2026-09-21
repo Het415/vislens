@@ -20,7 +20,7 @@ Conventions, and the reasoning behind each: [CLAUDE.md](CLAUDE.md).
 | Component | State |
 |---|---|
 | Compliance checks (`src/vislens/rules/image_rules.py`) | **built** — 6 deterministic checks |
-| Rule thresholds (`data/image_rules/rules_v1.json`) | **built** — committed with provenance |
+| Rule thresholds (`src/vislens/rules/rules_v1.json`) | **built** — committed with provenance, shipped as package data |
 | Agent wire payload | **built** — 7444 → 834 chars on a real 6-image listing |
 | Hardened image fetcher (`src/vislens/fetch/`) | **built** — 6 SSRF controls, 72 tests |
 | Audit service (`src/vislens/service/app.py`) | **built** — verified end to end on a live listing |

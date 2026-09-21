@@ -22,7 +22,8 @@ one to ship rather than assert it:
 
 All three return 64-bit ints (tiled returns sixteen of them), compared by
 Hamming distance. Nothing here picks a threshold: thresholds are calibrated
-against a labeled pair set and live in `data/near_duplicate/`, because a
+against a labeled pair set and ship as package data in `thresholds_v1.json`,
+because a
 threshold asserted without measurement is a number made up.
 """
 

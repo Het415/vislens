@@ -1,7 +1,7 @@
 """Calibrate the near-duplicate threshold against the labeled pair set.
 
 Writes a dated report to `eval/reports/` and, with `--write`, records the
-selected method and threshold into `data/near_duplicate/thresholds_v1.json`.
+selected method and threshold into `src/vislens/rules/thresholds_v1.json`.
 Until that file says `calibrated: true`, the detector refuses to report
 duplicates rather than using a guessed cutoff.
 
@@ -52,7 +52,11 @@ from vislens.rules.image_hash import (  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SET_DIR = ROOT / "data" / "near_dup_set"
 REPORTS = ROOT / "eval" / "reports"
-THRESHOLDS = ROOT / "data" / "near_duplicate" / "thresholds_v1.json"
+# Written into the package, because that is where it is read from — the file
+# ships as package data so `pip install .` carries it. Writing a calibrated
+# threshold into `src/` looks odd for a second and is right: it is
+# source-controlled configuration with a provenance record, not an artifact.
+THRESHOLDS = ROOT / "src" / "vislens" / "rules" / "thresholds_v1.json"
 
 PRECISION_FLOOR = 0.95
 PER_TILE_MAX_BITS = 10

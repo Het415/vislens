@@ -179,3 +179,34 @@ jobs:
 
           print("service imports cleanly on the serving set: PIL, numpy, scipy only")
           PY
+
+      - name: Confirm the rule thresholds ship in the wheel
+        # The regression test for a bug that was invisible at build time. The
+        # thresholds used to live at the repo root under `data/` and be resolved
+        # with `Path(__file__).resolve().parents[3]`, so a non-editable install
+        # imported the service cleanly and raised FileNotFoundError on the first
+        # request. They now ship as package data and are read through
+        # `importlib.resources`.
+        #
+        # This runs from a different directory ON PURPOSE. Run from the repo
+        # root, a lookup that had quietly fallen back to the checkout would
+        # still succeed and this step would prove nothing.
+        run: |
+          cd "$(mktemp -d)"
+          python - <<'PY'
+          import sys
+          from importlib import resources
+
+          from vislens.rules.image_dedup import load_thresholds
+          from vislens.rules.image_rules import load_rules
+
+          rules, thresholds = load_rules(), load_thresholds()
+          assert rules.get("checks"), "rules_v1.json loaded but carries no checks"
+          assert thresholds.get("calibrated") is True, "thresholds_v1.json is not calibrated"
+
+          where = resources.files("vislens.rules")
+          if "site-packages" not in str(where):
+              sys.exit(f"::error::resolved from {where}, not from the installed package")
+
+          print(f"both rule files resolved from the installed package at {where}")
+          PY

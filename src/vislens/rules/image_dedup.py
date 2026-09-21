@@ -28,23 +28,33 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from functools import lru_cache
+from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
 from .image_hash import ImageHashes, hamming, tile_agreement
 
-_THRESHOLDS_PATH = (
-    Path(__file__).resolve().parents[3] / "data" / "near_duplicate" / "thresholds_v1.json"
-)
+# Shipped as PACKAGE DATA, deliberately, and read through `importlib.resources`
+# rather than a path relative to `__file__`.
+#
+# The previous form was `Path(__file__).resolve().parents[3] / "data" / ...`,
+# which is the repo root from a source checkout and the interpreter's
+# `lib/python3.11` directory from site-packages. Measured: the wheel carried 17
+# entries and no data files, so `pip install .` produced a service that imported
+# cleanly and then raised FileNotFoundError on its first request. `importlib`
+# resolves identically either way, which is the whole point — and it is why
+# `render.yaml` no longer has to pin an editable install to stay alive.
+THRESHOLDS_RESOURCE = "thresholds_v1.json"
 
 Method = Literal["phash", "dhash", "tiles"]
 
 
 @lru_cache(maxsize=4)
 def load_thresholds(path: str | None = None) -> dict[str, Any]:
-    p = Path(path) if path else _THRESHOLDS_PATH
-    with open(p) as f:
-        return json.load(f)
+    if path:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    resource = resources.files("vislens.rules").joinpath(THRESHOLDS_RESOURCE)
+    return json.loads(resource.read_text(encoding="utf-8"))
 
 
 def calibrated_method(thresholds: dict[str, Any] | None = None) -> str | None:

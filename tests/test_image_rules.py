@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -814,3 +815,54 @@ def test_partially_transparent_rgba_still_warns(rules):
     img = decode_for_audit(buf.getvalue(), rules)
     assert img.had_alpha is True
     assert "transparent" in check_white_background(img, rules).reason
+
+
+# ── Packaging: where the thresholds come from ─────────────────────────────────
+
+
+def test_both_rule_files_ship_inside_the_package():
+    """The bug this guards was invisible until the first request in production.
+
+    Both files used to sit at the repo root under `data/` and be resolved with
+    `Path(__file__).resolve().parents[3]` — the repo root from a source
+    checkout, the interpreter's `lib/python3.11` from site-packages. The wheel
+    carried neither, so `pip install .` built green, imported cleanly, and
+    raised FileNotFoundError the moment an audit ran. Only an editable install
+    worked, which is a deployment constraint nobody would guess from the code.
+
+    CI installs non-editable and loads both files, which is the real guard. This
+    one is cheaper and catches the likelier regression: someone reintroducing a
+    copy under `data/` and leaving two definitions of the same thresholds.
+    """
+    from importlib import resources
+
+    from vislens.rules import image_dedup, image_rules
+
+    package = resources.files("vislens.rules")
+    for name in (image_rules.RULES_RESOURCE, image_dedup.THRESHOLDS_RESOURCE):
+        assert package.joinpath(name).is_file(), name
+
+    # Asserted on FILES, not on the directories. `git mv` leaves the old
+    # directories behind on a machine that had them, and an empty directory is
+    # harmless; a reintroduced JSON is the regression.
+    root = Path(image_rules.__file__).resolve().parents[3]
+    for stale in (root / "data" / "image_rules", root / "data" / "near_duplicate"):
+        found = sorted(stale.glob("*.json")) if stale.is_dir() else []
+        assert not found, f"{found} is back — two definitions of one threshold"
+
+
+def test_the_loaders_read_the_packaged_copy_by_default():
+    """And an explicit path still overrides it, which the calibration script and
+    the rule-provenance tests both rely on."""
+    from importlib import resources
+
+    from vislens.rules.image_dedup import THRESHOLDS_RESOURCE, load_thresholds
+    from vislens.rules.image_rules import RULES_RESOURCE
+
+    packaged = json.loads(resources.files("vislens.rules").joinpath(RULES_RESOURCE).read_text())
+    assert load_rules() == packaged
+
+    override = json.loads(
+        resources.files("vislens.rules").joinpath(THRESHOLDS_RESOURCE).read_text()
+    )
+    assert load_thresholds() == override

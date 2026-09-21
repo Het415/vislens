@@ -39,21 +39,16 @@ services:
     # the new instance answers, rather than swapping traffic onto a process that
     # is still importing scipy.
     healthCheckPath: /healthz
-    # EDITABLE INSTALL, AND IT HAS TO BE. `pip install .` breaks this service at
-    # its first request, silently as far as the build log is concerned.
-    #
-    # Measured: the wheel contains 17 entries and none of them are data files —
-    # `[tool.hatch.build.targets.wheel]` packages `src/vislens`, and the
-    # thresholds live at the repo root in `data/image_rules/rules_v1.json` and
-    # `data/near_duplicate/thresholds_v1.json`. Both modules resolve them with
-    # `Path(__file__).resolve().parents[3]`, which is the repo root from a
-    # source checkout and the interpreter's `lib/python3.11` directory from
-    # site-packages. So a non-editable install imports fine and then cannot find
-    # a single threshold it needs.
-    #
-    # `-e` keeps the checkout in place, so parents[3] is the repo root again. The
-    # durable fix is to ship those JSONs as package data and read them through
-    # `importlib.resources`; until then, do not "tidy" this line.
+    # A plain, non-editable install, which is worth a note because it briefly
+    # could not be one. The rule thresholds used to live at the repo root under
+    # `data/` and be resolved with `Path(__file__).resolve().parents[3]` — the
+    # repo root from a checkout, the interpreter's `lib/python3.11` from
+    # site-packages — so `pip install .` produced a service that imported
+    # cleanly and raised FileNotFoundError on its first request. `-e` was the
+    # workaround. As of 2026-09-21 the JSONs ship as package data inside
+    # `vislens.rules` and are read through `importlib.resources`, which resolves
+    # the same way either way, so the workaround is gone. CI installs
+    # non-editable and loads both files, which is what keeps it gone.
     #
     # No extras. The default dependency set is the serving set — pillow, numpy,
     # scipy, fastapi, uvicorn, python-multipart, requests — and `data`, `bench`
@@ -64,7 +59,7 @@ services:
     # wheel installs in seconds.
     buildCommand: |
       pip install --upgrade pip &&
-      pip install --prefer-binary -e .
+      pip install --prefer-binary .
     startCommand: uvicorn vislens.service.app:app --host 0.0.0.0 --port $PORT
     envVars:
       # Render runs this on the NATIVE python runtime, so nothing from a
