@@ -8,6 +8,7 @@ no ToS surface, and it is the one the UI defaults to.
 from __future__ import annotations
 
 import io
+import os
 
 import numpy as np
 import pytest
@@ -535,6 +536,55 @@ def test_cors_regex_is_anchored_not_suffix_matched(client):
             headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
         )
         assert response.headers.get("access-control-allow-origin") != origin, origin
+
+
+@pytest.mark.parametrize(
+    ("env", "expect_origins", "expect_regex"),
+    [
+        ({}, 3, True),
+        ({"VISLENS_CORS_ORIGINS": "", "VISLENS_CORS_ORIGIN_REGEX": ""}, 3, True),
+        ({"VISLENS_CORS_ORIGIN_REGEX": "none"}, 3, False),
+        ({"VISLENS_CORS_ORIGINS": "https://only.example"}, 1, True),
+    ],
+)
+def test_an_empty_cors_variable_means_unset_not_disabled(env, expect_origins, expect_regex):
+    """A blank deploy form must not be able to switch CORS off.
+
+    Render's blueprint flow prompts for every `sync: false` variable, and a blank
+    answer arrives as an EMPTY STRING rather than an absent one — so
+    `os.getenv(key, default)` returns "" and skips the default. The first version
+    of this read an empty regex as "disable" and an empty list as "no origins",
+    which together closed CORS completely: the upload card would have failed on
+    the first deploy with nothing in the service log to explain it.
+
+    Turning CORS off has to be something a human typed. Run in a subprocess
+    because the module reads the environment once, at import.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "from vislens.service.app import ALLOWED_ORIGINS, _cors_kwargs;"
+        "print(len(ALLOWED_ORIGINS), 'allow_origin_regex' in _cors_kwargs)"
+    )
+    # Start from an environment with both variables removed, so the "unset" case
+    # is genuinely unset even when the developer running this has them exported.
+    child_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("VISLENS_CORS_ORIGINS", "VISLENS_CORS_ORIGIN_REGEX")
+    }
+    child_env.update(env)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=child_env,
+    )
+    assert result.returncode == 0, result.stderr
+    count, regex = result.stdout.split()
+    assert int(count) == expect_origins
+    assert (regex == "True") is expect_regex
 
 
 def test_cors_rejects_an_unlisted_origin(client):

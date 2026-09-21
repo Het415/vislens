@@ -70,12 +70,18 @@ services:
       # none, because its absence reads as "that code path did not run".
       - key: PYTHONUNBUFFERED
         value: "1"
-      # Both optional: the defaults in `vislens.service.app` already allow
-      # localhost:3000 and https://listinglens.hetprajapati.me, plus any
-      # *.vercel.app or *.hetprajapati.me subdomain via the origin regex. Set
-      # either here to override without a code change — VISLENS_CORS_ORIGINS as
-      # a comma-separated exact list, VISLENS_CORS_ORIGIN_REGEX to "none" to
-      # switch the regex off.
+      # Both optional, and SAFE TO LEAVE BLANK in the blueprint form. Render
+      # prompts for every `sync: false` variable, and a blank answer arrives as
+      # an empty string rather than an absent one — so the service treats empty
+      # as unset and falls back to its defaults, which already allow
+      # localhost:3000 and https://listinglens.hetprajapati.me plus any
+      # *.vercel.app or *.hetprajapati.me subdomain. The first version read an
+      # empty regex as "disable" and would have closed CORS entirely on the
+      # first deploy, with nothing in the log to say why.
+      #
+      # Set VISLENS_CORS_ORIGINS to a comma-separated exact list to override, or
+      # VISLENS_CORS_ORIGIN_REGEX to "none" to switch the regex off. Switching
+      # CORS off has to be something someone typed.
       - key: VISLENS_CORS_ORIGINS
         sync: false
       - key: VISLENS_CORS_ORIGIN_REGEX

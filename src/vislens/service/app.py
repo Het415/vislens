@@ -76,12 +76,19 @@ app = FastAPI(
 # cookies, so there is nothing for a credentialed cross-origin request to carry
 # — and leaving it off means a permissive origin list cannot be escalated into
 # reading an authenticated response.
+DEFAULT_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://listinglens.hetprajapati.me"
+
+# `or DEFAULT_ORIGINS`, not `os.getenv(key, DEFAULT)` — the two differ exactly
+# when the variable is present and EMPTY, which is the case a host creates for
+# you. Render's blueprint flow prompts for every `sync: false` variable and a
+# blank answer becomes an empty string, not an absent one, so the plain default
+# would have been skipped and this list would have been empty on the first
+# deploy. Combined with the regex rule below, that closed CORS completely and
+# the upload card would have failed with nothing in the service log to explain
+# it. An empty value means "I did not set this", which is what unset means.
 ALLOWED_ORIGINS = [
     o.strip()
-    for o in os.getenv(
-        "VISLENS_CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,https://listinglens.hetprajapati.me",
-    ).split(",")
+    for o in (os.getenv("VISLENS_CORS_ORIGINS") or DEFAULT_ORIGINS).split(",")
     if o.strip()
 ]
 
@@ -91,7 +98,9 @@ ALLOWED_ORIGINS = [
 # that reason; keeping the two in step means a domain change is one edit each
 # rather than a hunt.
 #
-# Set to "none" (or empty) to disable it and rely on the exact list alone.
+# Set it to "none" to disable it and rely on the exact list alone. An empty
+# value is NOT a way to disable it — see DEFAULT_ORIGINS above. Turning the whole
+# of CORS off has to be something you typed, not something a deploy form did.
 #
 # Worth being plain about what this is NOT. CORS is not an access control here:
 # it governs what a *browser* will let a page read, and anything holding an HTTP
@@ -99,10 +108,8 @@ ALLOWED_ORIGINS = [
 # host allowlist, MAX_IMAGE_BYTES and MAX_IMAGES_PER_AUDIT. Widening this regex
 # does not widen the attack surface, and narrowing it would not protect
 # anything — it would only break the frontend.
-CORS_ORIGIN_REGEX = os.getenv(
-    "VISLENS_CORS_ORIGIN_REGEX",
-    r"https://([a-z0-9-]+\.)*(vercel\.app|hetprajapati\.me)",
-).strip()
+DEFAULT_ORIGIN_REGEX = r"https://([a-z0-9-]+\.)*(vercel\.app|hetprajapati\.me)"
+CORS_ORIGIN_REGEX = (os.getenv("VISLENS_CORS_ORIGIN_REGEX") or DEFAULT_ORIGIN_REGEX).strip()
 
 _cors_kwargs: dict[str, Any] = {
     "allow_origins": ALLOWED_ORIGINS,
@@ -110,7 +117,7 @@ _cors_kwargs: dict[str, Any] = {
     "allow_methods": ["GET", "POST", "OPTIONS"],
     "allow_headers": ["Content-Type"],
 }
-if CORS_ORIGIN_REGEX.lower() not in ("", "none", "false"):
+if CORS_ORIGIN_REGEX.lower() not in ("none", "off", "false"):
     _cors_kwargs["allow_origin_regex"] = CORS_ORIGIN_REGEX
 
 app.add_middleware(CORSMiddleware, **_cors_kwargs)
