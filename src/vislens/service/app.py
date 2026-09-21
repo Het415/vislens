@@ -80,18 +80,40 @@ ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv(
         "VISLENS_CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
+        "http://localhost:3000,http://127.0.0.1:3000,https://listinglens.hetprajapati.me",
     ).split(",")
     if o.strip()
 ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
-)
+# Vercel gives every preview deployment its own hostname, so an exact list goes
+# stale on the next push to a branch and the upload card silently stops working
+# on previews only. The sibling repo's backend already carries this regex for
+# that reason; keeping the two in step means a domain change is one edit each
+# rather than a hunt.
+#
+# Set to "none" (or empty) to disable it and rely on the exact list alone.
+#
+# Worth being plain about what this is NOT. CORS is not an access control here:
+# it governs what a *browser* will let a page read, and anything holding an HTTP
+# client ignores all of it. What actually bounds this service is the fetcher's
+# host allowlist, MAX_IMAGE_BYTES and MAX_IMAGES_PER_AUDIT. Widening this regex
+# does not widen the attack surface, and narrowing it would not protect
+# anything — it would only break the frontend.
+CORS_ORIGIN_REGEX = os.getenv(
+    "VISLENS_CORS_ORIGIN_REGEX",
+    r"https://([a-z0-9-]+\.)*(vercel\.app|hetprajapati\.me)",
+).strip()
+
+_cors_kwargs: dict[str, Any] = {
+    "allow_origins": ALLOWED_ORIGINS,
+    "allow_credentials": False,
+    "allow_methods": ["GET", "POST", "OPTIONS"],
+    "allow_headers": ["Content-Type"],
+}
+if CORS_ORIGIN_REGEX.lower() not in ("", "none", "false"):
+    _cors_kwargs["allow_origin_regex"] = CORS_ORIGIN_REGEX
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 # Bounded LRU. Unbounded would be a slow memory leak on a 512 MB instance, which
 # is the failure the parent project already hit once with an unbounded chain

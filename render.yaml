@@ -1,0 +1,100 @@
+# Deployment for the audit service, and only the audit service.
+#
+# Nothing else in this repo is deployed: the catalog build and the shard packer
+# are offline scripts run by hand, and the training half runs on Kaggle. So this
+# blueprint describes one small FastAPI process whose entire job is to decode
+# images, run the deterministic checks, and return the payload ListingLens'
+# agent consumes.
+#
+# Why Render and not Vercel, which already hosts the frontend. Three hard
+# limits, checked against Vercel's docs rather than remembered:
+#
+#   1. Vercel Functions cap a request body at 4.5 MB. This service accepts up
+#      to MAX_IMAGES_PER_AUDIT (12) files at MAX_IMAGE_BYTES (8 MB) each, and
+#      the browser posts them straight here. That is the blocking one.
+#   2. Vercel's Python runtime offers 3.12, 3.13 and 3.14 — not 3.11, which
+#      this repo pins to match Kaggle's GPU image. The pin is load-bearing for
+#      the training half, so relaxing it to satisfy a host is the wrong trade.
+#   3. `GET /audit/{id}` reads a bounded in-memory LRU. Per-invocation
+#      isolation would turn an occasional 404 into a near-certain one.
+#
+# None of that is a criticism of Vercel; the frontend stays there. It is a
+# long-lived CPU-bound process, which is a different shape of thing.
+
+services:
+  - type: web
+    name: vislens-audit
+    # `env` rather than the newer `runtime` spelling: both are accepted, and
+    # this matches the sibling repo's blueprint, which is live on this account.
+    env: python
+    # Free tier, deliberately, and the cost is understood rather than ignored.
+    # A free instance spins down when idle and takes 32-81s to come back
+    # (measured on this project's own hosting). ListingLens' image_audit tool
+    # sets an 8s timeout ON PURPOSE for exactly this: the audit enriches an
+    # answer the agent can already give, so it degrades to `unavailable` on a
+    # cold start and works on the next request. Move to `starter` ($7/mo) to
+    # remove spin-down — note it does NOT raise the 512 MB memory ceiling.
+    plan: free
+    # The service's own liveness endpoint. Render uses it to hold a deploy until
+    # the new instance answers, rather than swapping traffic onto a process that
+    # is still importing scipy.
+    healthCheckPath: /healthz
+    # EDITABLE INSTALL, AND IT HAS TO BE. `pip install .` breaks this service at
+    # its first request, silently as far as the build log is concerned.
+    #
+    # Measured: the wheel contains 17 entries and none of them are data files —
+    # `[tool.hatch.build.targets.wheel]` packages `src/vislens`, and the
+    # thresholds live at the repo root in `data/image_rules/rules_v1.json` and
+    # `data/near_duplicate/thresholds_v1.json`. Both modules resolve them with
+    # `Path(__file__).resolve().parents[3]`, which is the repo root from a
+    # source checkout and the interpreter's `lib/python3.11` directory from
+    # site-packages. So a non-editable install imports fine and then cannot find
+    # a single threshold it needs.
+    #
+    # `-e` keeps the checkout in place, so parents[3] is the repo root again. The
+    # durable fix is to ship those JSONs as package data and read them through
+    # `importlib.resources`; until then, do not "tidy" this line.
+    #
+    # No extras. The default dependency set is the serving set — pillow, numpy,
+    # scipy, fastapi, uvicorn, python-multipart, requests — and `data`, `bench`
+    # and `train` are all excluded on purpose. CI asserts torch never reaches a
+    # default install; this is the same rule at deploy time.
+    #
+    # `--prefer-binary` matters: scipy's sdist compiles for many minutes and its
+    # wheel installs in seconds.
+    buildCommand: |
+      pip install --upgrade pip &&
+      pip install --prefer-binary -e .
+    startCommand: uvicorn vislens.service.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      # Render runs this on the NATIVE python runtime, so nothing from a
+      # Dockerfile ENV block applies. Without this, Python batches stdout and
+      # the service's diagnostics arrive tens of seconds late or not at all —
+      # the sibling project lost the exact log window it was investigating to
+      # this twice in one day. A diagnostic that does not arrive is worse than
+      # none, because its absence reads as "that code path did not run".
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # Both optional: the defaults in `vislens.service.app` already allow
+      # localhost:3000 and https://listinglens.hetprajapati.me, plus any
+      # *.vercel.app or *.hetprajapati.me subdomain via the origin regex. Set
+      # either here to override without a code change — VISLENS_CORS_ORIGINS as
+      # a comma-separated exact list, VISLENS_CORS_ORIGIN_REGEX to "none" to
+      # switch the regex off.
+      - key: VISLENS_CORS_ORIGINS
+        sync: false
+      - key: VISLENS_CORS_ORIGIN_REGEX
+        sync: false
+
+# ── Not set here, and needed on the OTHER two services ───────────────────────
+#
+# Once this is live, two variables point at it. Neither belongs in this file:
+#
+#   VISLENS_URL              on ListingLens' Render service (the agent's tool;
+#                            defaults to localhost:8100 and degrades cleanly)
+#   NEXT_PUBLIC_VISLENS_URL  on ListingLens' Vercel project (the upload card)
+#
+# The Vercel one is inlined at BUILD time, so setting it is not enough — the
+# frontend has to be redeployed afterwards. Until then the deployed bundle
+# carries `http://localhost:8100`, and because the page is https the browser
+# blocks the request as mixed content before it is ever sent.

@@ -491,6 +491,52 @@ def test_cors_does_not_allow_credentials(client):
     }
 
 
+PROD_ORIGIN = "https://listinglens.hetprajapati.me"
+
+
+def test_cors_allows_the_deployed_frontend(client):
+    """The production origin is in the default list, so a deploy that forgets
+    to set VISLENS_CORS_ORIGINS still serves the real frontend rather than
+    failing in a way only a browser console shows."""
+    response = client.options(
+        "/audit/upload",
+        headers={
+            "Origin": PROD_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code in (200, 204)
+    assert response.headers["access-control-allow-origin"] == PROD_ORIGIN
+
+
+def test_cors_allows_a_vercel_preview_hostname(client):
+    """Why the regex exists: Vercel names every preview deployment differently,
+    so an exact list works on production and silently breaks on branches."""
+    origin = "https://listinglens-git-feat-audit-het415.vercel.app"
+    response = client.options(
+        "/audit/upload",
+        headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
+    )
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_cors_regex_is_anchored_not_suffix_matched(client):
+    """The same mistake the fetcher's host allowlist exists to avoid, one layer
+    up: a suffix check would hand `hetprajapati.me.attacker.net` the origin it
+    asked for."""
+    for origin in (
+        "https://hetprajapati.me.attacker.net",
+        "https://vercel.app.attacker.net",
+        "https://nothetprajapati.me",
+        "http://listinglens.hetprajapati.me",  # plain http, not https
+    ):
+        response = client.options(
+            "/audit/upload",
+            headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
+        )
+        assert response.headers.get("access-control-allow-origin") != origin, origin
+
+
 def test_cors_rejects_an_unlisted_origin(client):
     response = client.options(
         "/audit/upload",
