@@ -210,3 +210,41 @@ jobs:
 
           print(f"both rule files resolved from the installed package at {where}")
           PY
+
+  training:
+    name: Training code (CPU)
+    runs-on: ubuntu-latest
+
+    # A THIRD job, and it has to be separate from `test`. The training code
+    # imports torch, and the `test` job asserts torch is ABSENT from a serving
+    # install — the two cannot share an environment without one of them
+    # becoming a lie. So `test` stays torch-free and skips these tests via
+    # `pytest.importorskip`, and this job installs `[train]` and runs them.
+    #
+    # The CPU wheel index is not an optimisation: the default Linux torch wheel
+    # carries CUDA and is ~2.5 GB, for a job with no GPU.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install with the train extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install --prefer-binary -e ".[dev,data,train]"
+
+      - name: Confirm torch is actually importable
+        # Without this the suite could SKIP rather than run — `importorskip`
+        # turns a broken install into a green tick, which is the one failure
+        # mode a guarded test file introduces.
+        run: python -c "import torch, webdataset; print(torch.__version__)"
+
+      - name: Pytest (training)
+        run: pytest tests/test_training.py -q

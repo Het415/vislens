@@ -29,13 +29,13 @@ Conventions, and the reasoning behind each: [CLAUDE.md](CLAUDE.md).
 | SKU group-mismatch finding | **built** — gated at the calibrated threshold |
 | ABO catalog build | **built** — 145,614 products, 535,602 images, two leaks closed |
 | WebDataset shard packing | **built** — 405,116 samples in 42 shards, ~30s, reproducible |
-| Encoder training | not started — needs GPU acquisition |
+| Encoder training | **written, unrun** — two-tower + masked InfoNCE, smoke-tested on CPU against the real shards; needs a GPU |
 | Retrieval eval harness | not started |
 | ListingLens client + agent wiring | **built** — in the sibling repo, 21 tests |
 | ABO `en_US` gate | **measured** — see below |
 | Split-leakage fix | **measured** — 27,554 leaking images → 0, then 5 more the packer caught |
 | Split reproducibility | **measured** — two builds, one byte-identical assignment |
-| CI | **built** — ruff + 240 tests, no secrets, no network, no GPU |
+| CI | **built** — ruff + 271 tests across three jobs, no secrets, no network, no GPU |
 
 Nothing above is claimed in a UI before it is backed by code. That rule exists because the
 predecessor repo shipped a landing page advertising *"CLIP model analyzes your product images for
@@ -448,9 +448,11 @@ recall delta published.
 uv venv --python 3.11 && uv pip install -e ".[dev,data]" && .venv/bin/pytest
 ```
 
-240 tests (72 fetch controls, 65 rules, 33 service, 30 near-duplicate, 26 catalog build,
-14 shard packing), ~19s, no network and no API key — which is why the whole suite runs in CI
-on every push.
+271 tests (72 fetch controls, 65 rules, 33 service, 30 near-duplicate, 26 catalog build,
+14 shard packing, 22 training), no network, no API key and no GPU — which is why the whole suite
+runs in CI on every push. The 22 training tests need the `train` extra and skip without it; a
+dedicated CI job installs CPU torch and runs them, so the main job can go on asserting that torch
+is **absent** from a serving install.
 Then start the service:
 
 ```bash
