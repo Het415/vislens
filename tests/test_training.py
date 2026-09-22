@@ -270,3 +270,74 @@ def test_train_writes_a_complete_run_record(tmp_path):
     # The preprocessing config travels with the run, so a checkpoint can never
     # be replayed under a different resize than it was trained on.
     assert "preprocess" in json.loads((run / "config.json").read_text())
+
+
+# ── Text embeddings ───────────────────────────────────────────────────────────
+
+
+def test_text_embeddings_round_trip_through_fp16(tmp_path):
+    """Stored as fp16 to halve a 124 MB file that has to reach Kaggle; loaded
+    as fp32 because the cast is free next to a forward pass."""
+    from vislens.data.text_emb import load_text_embeddings, save_text_embeddings
+
+    keys = [f"pairs/PROD{i:03d}-00" for i in range(5)]
+    original = np.random.RandomState(0).randn(5, 512).astype(np.float32)
+    original /= np.linalg.norm(original, axis=1, keepdims=True)
+
+    path = save_text_embeddings(tmp_path / "val.npz", keys, original, meta={"model": "ViT-B-32"})
+    lookup, matrix = load_text_embeddings(path)
+
+    assert lookup == {k: i for i, k in enumerate(keys)}
+    assert matrix.dtype == torch.float32
+    # fp16 keeps ~3 decimal digits; enough for an input to a trained projection.
+    assert torch.allclose(matrix, torch.from_numpy(original), atol=1e-3)
+    assert torch.allclose(matrix.norm(dim=-1), torch.ones(5), atol=1e-2)
+
+
+def test_mismatched_keys_and_rows_are_refused(tmp_path):
+    """Silent misalignment would attach every embedding to the wrong image."""
+    from vislens.data.text_emb import save_text_embeddings
+
+    with pytest.raises(ValueError):
+        save_text_embeddings(tmp_path / "bad.npz", ["a", "b"], np.zeros((3, 4), dtype=np.float32))
+
+
+def test_encode_deduplicates_but_returns_one_row_per_input():
+    """A frozen encoder maps identical strings to identical vectors, so
+    encoding repeats is waste — but the file must still be one row per key, or
+    every consumer has to understand the deduplication."""
+    from scripts.precompute_text import encode
+
+    seen: list[list[str]] = []
+
+    def tokenizer(chunk):
+        seen.append(list(chunk))
+        return torch.arange(len(chunk))
+
+    def encoder(tokens):
+        # Distinct in DIRECTION, not just magnitude: `encode` L2-normalises, so
+        # two constant vectors of different scale would normalise to the same
+        # point and the test would be asserting nothing.
+        return torch.stack([torch.eye(8)[int(t) % 8] + 0.1 for t in tokens])
+
+    titles = ["red shoe", "blue sofa", "red shoe", "red shoe", "blue sofa"]
+    out = encode(titles, encoder, tokenizer, device="cpu")
+
+    assert out.shape == (5, 8)
+    assert sum(len(c) for c in seen) == 2, "only the unique titles should be encoded"
+    # Equal titles must come back as equal rows.
+    assert np.allclose(out[0], out[2]) and np.allclose(out[0], out[3])
+    assert np.allclose(out[1], out[4])
+    assert not np.allclose(out[0], out[1])
+
+
+def test_a_pairs_sample_without_a_title_is_an_error(tmp_path, monkeypatch):
+    """Not a skip. Skipping would shift every key/row pair after it by one,
+    and the embeddings would load fine attached to the wrong images."""
+    import scripts.precompute_text as pre
+
+    monkeypatch.setattr(
+        pre, "iter_samples", lambda *a, **k: iter([{"key": "pairs/X-00", "title": ""}])
+    )
+    with pytest.raises(ValueError, match="no title"):
+        pre.collect("val", None)
