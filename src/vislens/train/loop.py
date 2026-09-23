@@ -288,6 +288,17 @@ def train(
                 metrics_file.flush()
 
         val = evaluate(model, val_loader, device, config)
+        if not val["val_batches"]:
+            # Loud, because the silent version is expensive: no val batches
+            # means `val_loss` is NaN, the best-on-val comparison never fires,
+            # and a twelve-hour commit ends with no `best.pt` and no error. The
+            # usual cause is a text-embedding lookup covering only the training
+            # split — see `load_split_embeddings`.
+            raise RuntimeError(
+                "validation produced no usable batches: every val sample was dropped. "
+                "The text-embedding lookup probably does not cover the val split — "
+                "load it with vislens.data.text_emb.load_split_embeddings(dir, ('train', 'val'))."
+            )
         writer.writerow(
             {
                 "step": step,

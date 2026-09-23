@@ -341,3 +341,70 @@ def test_a_pairs_sample_without_a_title_is_an_error(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="no title"):
         pre.collect("val", None)
+
+
+def test_split_embeddings_merge_into_one_lookup(tmp_path):
+    """Training needs train AND val in one table. The val loader shares the
+    training collate, so a train-only lookup drops every val batch."""
+    from vislens.data.text_emb import load_split_embeddings, save_text_embeddings
+
+    for split, keys in (("train", ["a", "b", "c"]), ("val", ["d", "e"])):
+        save_text_embeddings(
+            tmp_path / f"{split}.npz",
+            keys,
+            np.random.RandomState(0).randn(len(keys), 8).astype(np.float32),
+        )
+    lookup, matrix = load_split_embeddings(tmp_path, ("train", "val"))
+
+    assert set(lookup) == {"a", "b", "c", "d", "e"}
+    assert matrix.shape == (5, 8)
+    # Offsets must be applied, or val rows would alias train rows.
+    assert sorted(lookup.values()) == [0, 1, 2, 3, 4]
+
+
+def test_a_key_in_two_splits_is_refused(tmp_path):
+    """Keys carry the product id and are globally unique. A collision means
+    the shards are wrong, and resolving it silently would train on a leak."""
+    from vislens.data.text_emb import load_split_embeddings, save_text_embeddings
+
+    for split in ("train", "val"):
+        save_text_embeddings(
+            tmp_path / f"{split}.npz", ["same"], np.zeros((1, 4), dtype=np.float32)
+        )
+    with pytest.raises(ValueError, match="more than one split"):
+        load_split_embeddings(tmp_path, ("train", "val"))
+
+
+def test_a_missing_split_file_is_refused(tmp_path):
+    from vislens.data.text_emb import load_split_embeddings, save_text_embeddings
+
+    save_text_embeddings(tmp_path / "train.npz", ["a"], np.zeros((1, 4), dtype=np.float32))
+    with pytest.raises(FileNotFoundError, match="val"):
+        load_split_embeddings(tmp_path, ("train", "val"))
+
+
+def test_validation_with_no_usable_batches_raises(tmp_path):
+    """The expensive silent failure, made loud.
+
+    A lookup that does not cover the val split leaves every val sample without
+    an embedding. `evaluate` then returns NaN, the best-on-val comparison never
+    fires, and a twelve-hour Kaggle commit ends with no `best.pt` and nothing
+    anywhere saying why.
+    """
+    shards = tmp_path / "shards"
+    shards.mkdir()
+    _write_shard(shards / "pairs-train-000000.tar", n=8)
+    _write_shard(shards / "pairs-val-000000.tar", n=8)
+
+    config = TrainConfig(
+        shards_dir=str(shards),
+        runs_dir=str(tmp_path / "runs"),
+        batch_size=4,
+        epochs=1,
+        subset_batches=1,
+        num_workers=0,
+        shuffle_buffer=0,
+        warmup_steps=1,
+    )
+    with pytest.raises(RuntimeError, match="no usable batches"):
+        train(_stub_model(), config, {}, torch.randn(8, 512), device="cpu")

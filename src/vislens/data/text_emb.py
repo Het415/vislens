@@ -61,3 +61,38 @@ def load_text_embeddings(path: str | Path):
         keys = [str(k) for k in data["keys"]]
         matrix = torch.from_numpy(data["emb"].astype(np.float32))
     return {key: i for i, key in enumerate(keys)}, matrix
+
+
+def load_split_embeddings(text_emb_dir: str | Path, splits=("train", "val")):
+    """Load several splits into ONE lookup and matrix.
+
+    The precompute writes a file per split; training needs both at once,
+    because the val loader shares the training collate and looks its keys up in
+    the same table. Handing `train()` a train-only lookup drops every val batch,
+    which makes `val_loss` NaN, which means `best.pt` is never written — a
+    twelve-hour Kaggle commit that produces no checkpoint and no error.
+
+    Keys are globally unique across splits (they carry the product id), so a
+    plain merge is safe; a collision would mean the shards themselves are
+    wrong and is raised rather than silently resolved.
+    """
+    import torch
+
+    lookup: dict[str, int] = {}
+    blocks = []
+    offset = 0
+    for split in splits:
+        path = embeddings_path(text_emb_dir, split)
+        if not path.exists():
+            raise FileNotFoundError(f"no text embeddings for {split!r} at {path}")
+        split_lookup, matrix = load_text_embeddings(path)
+        clashes = lookup.keys() & split_lookup.keys()
+        if clashes:
+            raise ValueError(
+                f"{len(clashes)} keys appear in more than one split, e.g. {list(clashes)[:3]}"
+            )
+        for key, row in split_lookup.items():
+            lookup[key] = row + offset
+        blocks.append(matrix)
+        offset += matrix.shape[0]
+    return lookup, torch.cat(blocks, dim=0)
