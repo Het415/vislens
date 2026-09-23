@@ -66,48 +66,74 @@ def load_corpus(limit: int | None):
 
 
 def embed_images(paths, encode_fn, batch: int = 64):
-    """Embed the corpus images through whichever tower was supplied."""
+    """Embed the corpus images in ONE streaming pass, holding no pixel buffer.
+
+    The obvious implementation decodes every image into a list and then embeds
+    the list. At the real corpus size that list is 145,614 x 3 x 224 x 224
+    float32 — **87 GB** — so it works perfectly on a `--limit 3000` smoke run
+    and dies on the only run that matters. Decoded pixels are therefore
+    accumulated one batch at a time and discarded as soon as they are embedded;
+    what survives is 145,614 x 512 floats, about 300 MB.
+
+    path -> LIST of slots, not one. Catalog rows share main images (467 of the
+    first 3,000), and a plain dict keeps only the last slot for a repeated
+    path, leaves the earlier ones unfilled, then reports them as absent from
+    the archive — an error blaming the data for a bug in the lookup.
+    """
     import tarfile
 
     from vislens.data.transforms import preprocess_bytes
 
-    # Read the bytes out of the source archive in one streaming pass rather
-    # than 121K random-access opens — the same reasoning as pack_shards.
-    #
-    # path -> LIST of slots, not one. Catalog rows share main images: 467 of
-    # the first 3,000 rows do. A plain dict keeps only the last slot for a
-    # repeated path, leaves the earlier ones unfilled, and then reports them as
-    # absent from the archive — which is what the first run of this did, with
-    # an error message blaming the data.
     wanted: dict[str, list[int]] = {}
     for i, path in enumerate(paths):
         wanted.setdefault(path, []).append(i)
-    pixels = [None] * len(paths)
+
+    out: np.ndarray | None = None
+    filled = np.zeros(len(paths), dtype=bool)
+    pending_pixels: list[np.ndarray] = []
+    pending_slots: list[list[int]] = []
+    started = time.time()
+    done = 0
+
+    def flush():
+        nonlocal out, pending_pixels, pending_slots, done
+        if not pending_pixels:
+            return
+        embedded = encode_fn(np.stack(pending_pixels))
+        if out is None:
+            out = np.zeros((len(paths), embedded.shape[1]), dtype=np.float32)
+        for row, slots in zip(embedded, pending_slots, strict=True):
+            for slot in slots:
+                out[slot] = row
+                filled[slot] = True
+        done += len(pending_pixels)
+        pending_pixels = []
+        pending_slots = []
+        if done % (batch * 40) == 0:
+            rate = done / max(time.time() - started, 1e-9)
+            remaining = (len(wanted) - done) / max(rate, 1e-9) / 60
+            print(f"    {done:,}/{len(wanted):,} images ({rate:,.0f}/s, ~{remaining:.1f} min left)")
+
     source = ROOT / "data" / "abo" / "abo-images-small.tar"
     with tarfile.open(source, "r|") as tf:
         for member in tf:
             if not member.isfile() or not member.name.startswith("images/small/"):
                 continue
-            key = member.name[len("images/small/") :]
-            slot = wanted.get(key)
-            if not slot:
+            slots = wanted.get(member.name[len("images/small/") :])
+            if not slots:
                 continue
             handle = tf.extractfile(member)
-            if handle is not None:
-                decoded = preprocess_bytes(handle.read())
-                for i in slot:
-                    pixels[i] = decoded
+            if handle is None:  # pragma: no cover - defensive
+                continue
+            pending_pixels.append(preprocess_bytes(handle.read()))
+            pending_slots.append(slots)
+            if len(pending_pixels) >= batch:
+                flush()
+    flush()
 
-    missing = [p for p, arr in zip(paths, pixels, strict=True) if arr is None]
-    if missing:
-        raise FileNotFoundError(f"{len(missing)} corpus images absent from {source.name}")
-
-    out = []
-    for start in range(0, len(pixels), batch):
-        out.append(encode_fn(np.stack(pixels[start : start + batch])))
-        if (start // batch) % 20 == 0:
-            print(f"    {min(start + batch, len(pixels)):,}/{len(pixels):,} images")
-    return np.concatenate(out, axis=0)
+    if out is None or not filled.all():
+        raise FileNotFoundError(f"{int((~filled).sum())} corpus images absent from {source.name}")
+    return out
 
 
 def build_encoders(checkpoint: str | None, device: str):
@@ -168,6 +194,12 @@ def markdown_report(rows, deltas, meta) -> str:
         "run-to-run noise floor; do not assume that convention here. The variance that exists is",
         "query-sampling and training-seed, so deltas below use a **paired bootstrap over queries**",
         f"({meta['resamples']:,} resamples, 95% CI).",
+        "",
+        f"Analytic random floor at R@50 is `50/{meta['corpus']:,}` = "
+        f"**{50 / meta['corpus']:.6f}** — about {50 / meta['corpus'] * meta['queries']:.0f} hits "
+        f"across {meta['queries']:,} queries. The sampled `random` row below is that draw, and at "
+        "single-digit hit counts it swings two- or three-fold on the seed alone. Read the analytic "
+        "value, not the sampled one.",
         "",
         f"**{meta['duplicate_targets']:,} of {meta['corpus']:,} corpus rows share a main image "
         "with another row.** Ties count against the system being scored, so a target whose "
