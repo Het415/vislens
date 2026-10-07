@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -33,9 +34,11 @@ from vislens.rules.image_rules import (
     check_resolution_and_format,
     check_white_background,
     decode_for_audit,
+    describe_colour,
     load_rules,
     worst_status,
 )
+from vislens.rules.seller_guidance import fix_for
 
 SIZE = 1000
 AREA = SIZE * SIZE
@@ -475,30 +478,20 @@ def test_worst_case_audit_still_fits_the_budget(rules):
     count check — built directly rather than photographed, so the worst case is
     guaranteed rather than hoped for.
     """
+    # Rule and reason text taken from the real checks, not typed here, so the
+    # budget is measured against the wording that actually ships.
+    tiny = decode(centered_square(400, size=400, bg=(200, 200, 200)), rules)
+    real = {r.check_id: r for r in audit_image(tiny, rules, is_main=True)}
     flagged_everything = [
-        CheckResult(
-            "resolution_and_format", "fail", "rule_exact", 400.0,
-            "longest side >= 1000px for zoom (>= 500px accepted)",
-            reason="longest side 400px is below the 500px minimum",
-        ),
-        CheckResult(
-            "white_background", "fail", "measured", 0.0,
-            "≥99% of the border band pure white (255,255,255)",
-            reason="only 0.0% of the border band is pure white; modal RGB (200, 200, 200)",
-        ),
-        CheckResult(
-            "frame_occupancy", "fail", "measured", 0.16,
-            "product bounding box ≥85% of the frame",
-            reason="product bounding box fills 16.0% of the frame (silhouette 16.0%)",
-        ),
-        CheckResult(
-            "background_artifacts", "fail", "measured", 3.0,
-            "no non-product marks on the background",
-            reason="3 non-product region(s) on the background (border_ring, corner_badge)",
+        replace(real["resolution_and_format"], status="fail", value=400.0),
+        replace(real["white_background"], status="fail", value=0.0),
+        replace(real["frame_occupancy"], status="fail", value=0.16),
+        replace(
+            real["background_artifacts"], status="fail", value=3.0,
         ),
         CheckResult(
             "aspect_ratio", "warn", "advisory", 4.0,
-            "square (1:1) is recommended, not required — not a rejection criterion",
+            real["aspect_ratio"].rule,
             reason="4.00:1 is 3.00 from square",
         ),
     ]
@@ -519,6 +512,11 @@ def test_worst_case_audit_still_fits_the_budget(rules):
     assert len(group["f"]) == 4
     # The advisory aspect-ratio finding is counted, not enumerated.
     assert group["n_measured_only"] == 1
+    # Every broken rule carries a fix; the advisory one must not, because a
+    # remedy beside it would assert a problem nobody found.
+    assert {c for c, e in payload["legend"].items() if "fix" in e} == {
+        "res", "wbg", "occ", "art", "cnt",
+    }
 
 
 def test_payload_carries_no_prose_notes(rules):
@@ -565,6 +563,88 @@ def test_payload_legend_carries_only_breached_rules(rules):
     # main image and a measurement on a secondary one, so one per-code tier
     # would mislabel one of them.
     assert "tier" not in entry
+
+
+# ── Seller guidance ───────────────────────────────────────────────────────────
+
+
+def test_broken_rules_carry_a_title_and_a_reshoot_fix(rules):
+    """The defect that motivated `seller_guidance`: given only auditor rule
+    text, the agent told a seller to "crop or adjust the shot so the product
+    fills ≥ 85 % of the frame", which neither the seller nor the developer
+    could act on. The fix has to arrive as data beside the verdict."""
+    img = decode(centered_square(400), rules)  # occupancy 0.16 -> fails
+    payload = build_audit_payload([audit_image(img, rules, is_main=True)], 6, rules)
+
+    entry = payload["legend"]["occ"]
+    assert entry["title"] == "Product size in the photo"
+    assert "closer" in entry["fix"]
+    assert "fix" in payload["key"]
+
+
+def test_measured_only_rules_get_no_fix(rules):
+    """A secondary photo's occupancy is measured, not judged. Its legend entry
+    exists, but a fix beside it would tell the seller to repair a lifestyle
+    shot that breaks no rule."""
+    img = decode(centered_square(400), rules)
+    payload = build_audit_payload([audit_image(img, rules, is_main=False)], 6, rules)
+
+    assert payload["groups"][0]["f"] == []
+    assert all("fix" not in entry for entry in payload["legend"].values())
+    assert "fix" not in payload["key"]
+
+
+def test_fix_numbers_come_from_the_rules_file(rules):
+    rules["checks"]["resolution_and_format"]["zoom_min_longest_side"] = 1600
+    assert "1,600 pixels" in fix_for("resolution_and_format", rules)
+
+
+def test_aspect_ratio_has_no_fix(rules):
+    """It is a recommendation, never a verdict, so there is nothing to fix."""
+    assert fix_for("aspect_ratio", rules) is None
+
+
+AUDITOR_JARGON = ("bounding box", "border band", "modal", "silhouette", "px", "frame")
+
+
+def test_seller_facing_text_has_no_auditor_jargon(rules):
+    """Everything a seller reads for a failing main image: the title, the rule,
+    the per-image reason and the fix. Each of these words reached a seller
+    before and meant nothing to them."""
+    # Two photos, because a grey background reads as one product filling the
+    # whole frame, so no single image can fail all of these at once.
+    small = centered_square(200, size=600)
+    small[10:40, 10:40] = (255, 0, 0)  # a mark in the corner
+    grey = centered_square(500, size=600, bg=(200, 200, 200))
+    per_image = [
+        audit_image(decode(small, rules), rules, is_main=True),
+        audit_image(decode(grey, rules), rules, is_main=True),
+    ]
+    payload = build_audit_payload(per_image, 2, rules)
+
+    broken = {f[0] for g in payload["groups"] for f in g["f"]}
+    assert {"res", "wbg", "occ", "art"} <= broken
+    seller_text = " ".join(
+        [e["title"] + " " + e["rule"] + " " + e.get("fix", "") for e in payload["legend"].values()]
+        + [r.reason for results in per_image for r in results if r.status != "pass"]
+    ).lower()
+    for word in AUDITOR_JARGON:
+        assert word not in seller_text, f"{word!r} reached the seller"
+
+
+@pytest.mark.parametrize(
+    ("rgb", "name"),
+    [
+        ((248, 248, 248), "off-white"),
+        ((200, 200, 200), "light grey"),
+        ((128, 128, 128), "grey"),
+        ((20, 20, 20), "dark grey or black"),
+        ((240, 220, 190), "a light reddish or warm colour"),
+        ((60, 90, 200), "a bluish colour"),
+    ],
+)
+def test_background_colour_is_named_for_a_seller(rgb, name):
+    assert describe_colour(rgb) == name
 
 
 def test_payload_headline_ignores_advisory_checks(rules):

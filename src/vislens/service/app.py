@@ -56,6 +56,7 @@ from vislens.rules.image_rules import (
     decode_for_audit,
     load_rules,
 )
+from vislens.rules.seller_guidance import DUPLICATE_FIX
 
 MAX_IMAGES_PER_AUDIT = 12
 FETCH_CONCURRENCY = 3
@@ -226,6 +227,10 @@ def _assemble(
         "threshold": dedup.threshold,
         "clusters": dedup.clusters,
     }
+    if dedup.clusters and dedup.calibrated:
+        # Same reason the legend carries a `fix`: without it the agent's advice
+        # for a duplicate pair was whatever it improvised.
+        compact["fix"] = DUPLICATE_FIX
     if dedup.skipped_featureless:
         compact["skipped_no_contrast"] = dedup.skipped_featureless
     if not dedup.calibrated:

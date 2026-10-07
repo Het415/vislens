@@ -42,6 +42,8 @@ import numpy as np
 from PIL import Image, ImageOps
 from scipy import ndimage
 
+from vislens.rules.seller_guidance import fix_for, title_for
+
 Status = Literal["pass", "warn", "fail", "skipped"]
 # `model` is a VLM judgement. It is reported and labelled, and it deliberately
 # does NOT appear in the verdict tiers that `worst_status` considers, so a model
@@ -369,6 +371,27 @@ def _modal_rgb(rgb: np.ndarray, mask: np.ndarray) -> tuple[int, int, int]:
     return ((top >> 16) & 255, (top >> 8) & 255, top & 255)
 
 
+def describe_colour(rgb: tuple[int, int, int]) -> str:
+    """A seller-readable name for a background colour.
+
+    `(200, 200, 200)` is exact and means nothing to someone holding a phone;
+    "light grey" tells them their white backdrop photographed grey, which is
+    the usual cause and the thing they can fix. Deliberately coarse — it names
+    the problem, the RGB triple beside it stays the evidence.
+    """
+    lo, hi = min(rgb), max(rgb)
+    if hi - lo <= 12:
+        if lo >= 235:
+            return "off-white"
+        if lo >= 180:
+            return "light grey"
+        if lo >= 90:
+            return "grey"
+        return "dark grey or black"
+    tint = ("reddish or warm", "greenish", "bluish")[rgb.index(hi)]
+    return f"a light {tint} colour" if lo >= 180 else f"a {tint} colour"
+
+
 # ── Checks ────────────────────────────────────────────────────────────────────
 
 
@@ -390,23 +413,30 @@ def check_resolution_and_format(
             "fail",
             "rule_exact",
             float(longest),
-            f"format must be one of {', '.join(cfg['accepted_formats'])}",
-            reason=f"format is {img.image_format}",
+            f"saved as one of {', '.join(cfg['accepted_formats'])}",
+            reason=f"the file is saved as {img.image_format}, which Amazon does not accept",
             detail=_res_detail(img, cfg),
         )
 
+    # Seller wording: "pixels on the longer side", never "px" or "longest side
+    # >= N". The number is the whole finding, so it stays; the notation goes.
     if longest > cfg["max_longest_side"]:
-        status, reason = "fail", f"longest side {longest}px exceeds {cfg['max_longest_side']}px"
+        status, reason = (
+            "fail",
+            f"the longer side is {longest:,} pixels, over Amazon's "
+            f"{cfg['max_longest_side']:,}-pixel maximum",
+        )
     elif longest < cfg["accepted_min_longest_side"]:
         status, reason = (
             "fail",
-            f"longest side {longest}px is below the {cfg['accepted_min_longest_side']}px minimum",
+            f"the longer side is only {longest:,} pixels, below Amazon's "
+            f"{cfg['accepted_min_longest_side']:,}-pixel minimum",
         )
     elif longest < cfg["zoom_min_longest_side"]:
         status, reason = (
             "warn",
-            f"{longest}px is accepted but below the {cfg['zoom_min_longest_side']}px "
-            "needed for zoom",
+            f"the longer side is {longest:,} pixels — Amazon accepts it, but "
+            f"shoppers can't zoom in below {cfg['zoom_min_longest_side']:,}",
         )
     else:
         status, reason = "pass", ""
@@ -416,8 +446,9 @@ def check_resolution_and_format(
         status,
         "rule_exact",
         float(longest),
-        f"longest side >= {cfg['zoom_min_longest_side']}px for zoom "
-        f"(>= {cfg['accepted_min_longest_side']}px accepted)",
+        f"at least {cfg['zoom_min_longest_side']:,} pixels on the longer side so "
+        f"shoppers can zoom in ({cfg['accepted_min_longest_side']:,} is the minimum "
+        "Amazon accepts)",
         reason=reason,
         detail=_res_detail(img, cfg),
     )
@@ -475,8 +506,8 @@ def check_image_count(n_supplied: int, rules: dict[str, Any] | None = None) -> C
         status = "warn"
         reason = (
             f"you supplied {n_supplied}; {cfg['recommended_min']}+ is recommended. "
-            f"The cap is typically {cfg['typical_cap']} but is category-dependent — "
-            "verify for your category"
+            f"Amazon usually allows up to {cfg['typical_cap']}, but it is "
+            "category-dependent — check yours"
         )
     else:
         status, reason = "pass", ""
@@ -486,7 +517,7 @@ def check_image_count(n_supplied: int, rules: dict[str, Any] | None = None) -> C
         status,
         "rule_exact",
         float(n_supplied),
-        f"{cfg['recommended_min']}+ images recommended",
+        f"{cfg['recommended_min']}+ photos recommended",
         reason=reason,
         detail={"n_images_supplied": n_supplied, "typical_cap": cfg["typical_cap"]},
     )
@@ -544,8 +575,8 @@ def check_white_background(
             "skipped",
             "measured",
             None,
-            "border band must be pure white",
-            reason="no border band to measure",
+            "pure white background around the edges of the photo",
+            reason="no background around the edges to measure",
             detail=base,
         )
 
@@ -572,8 +603,11 @@ def check_white_background(
             "warn",
             "measured",
             round(float(exact), 4),
-            "background must be pure white (255,255,255)",
-            reason="image has a transparent background; measured against a white composite",
+            "pure white background (255,255,255), not transparent",
+            reason=(
+                "the background is transparent, not white; it was measured as if "
+                "placed on white"
+            ),
             detail=detail,
         )
 
@@ -590,19 +624,21 @@ def check_white_background(
         # this is a white background with compression noise.
         status = "pass"
         reason = (
-            f"pure white with compression noise — modal RGB is (255,255,255), "
-            f"{exact:.1%} of the band exactly white"
+            "pure white, with the faint speckle JPEG saving adds — "
+            f"{exact:.1%} of the edge is exactly (255,255,255)"
         )
     elif near_ok:
         status, reason = (
             "warn",
-            f"background is near-white but not pure: modal RGB {modal}, "
-            f"{exact:.1%} of the band is exactly (255,255,255)",
+            f"the background is almost white but not pure: mostly {modal} "
+            f"({describe_colour(modal)}), and only {exact:.1%} of the edge is "
+            "exactly white (255,255,255)",
         )
     else:
         status, reason = (
             "fail",
-            f"only {exact:.1%} of the border band is pure white; modal RGB {modal}",
+            f"the background is {describe_colour(modal)}, mostly {modal}, not "
+            f"white — only {exact:.1%} of the edge of the photo is pure white",
         )
 
     return CheckResult(
@@ -610,7 +646,8 @@ def check_white_background(
         status,
         "measured",
         round(float(exact), 4),
-        f"≥{cfg['exact_white_pass_frac']:.0%} of the border band pure white (255,255,255)",
+        f"pure white (255,255,255) background on at least "
+        f"{cfg['exact_white_pass_frac']:.0%} of the photo's edge",
         reason=reason,
         detail=detail,
     )
@@ -639,8 +676,8 @@ def check_frame_occupancy(
             "skipped",
             "measured",
             None,
-            f"product bounding box ≥{cfg['min_bbox_occupancy']:.0%} of the frame",
-            reason="no product region detected; the image may be blank",
+            f"the product fills at least {cfg['min_bbox_occupancy']:.0%} of the photo",
+            reason="no product could be found; the image may be blank",
             detail=base,
         )
 
@@ -680,12 +717,16 @@ def check_frame_occupancy(
         "pass" if passed else "fail",
         "measured",
         round(float(bbox_occ), 4),
-        f"product bounding box ≥{cfg['min_bbox_occupancy']:.0%} of the frame",
+        f"the product fills at least {cfg['min_bbox_occupancy']:.0%} of the photo",
+        # "The box around it" is the bounding box in seller words, and it has
+        # to be said: a seller looking at a round product will otherwise
+        # measure its outline and get a smaller number than this one.
+        # Silhouette stays in `detail` for anyone checking the interpretation.
         reason=(
             ""
             if passed
-            else f"product bounding box fills {bbox_occ:.1%} of the frame "
-            f"(silhouette {sil_occ:.1%})"
+            else f"the product (the box around it) fills only {bbox_occ:.1%} of the "
+            "photo; the rest is empty background"
         ),
         detail=detail,
     )
@@ -766,23 +807,34 @@ def check_background_artifacts(
             "pass",
             "measured",
             0.0,
-            "no non-product marks on the background",
+            "nothing on the background except the product",
             detail=detail,
         )
 
-    hints = ", ".join(sorted({a["hint"] for a in artifacts}))
+    hints = ", ".join(sorted({_HINT_WORDS.get(a["hint"], a["hint"]) for a in artifacts}))
     return CheckResult(
         "background_artifacts",
         "fail",
         "measured",
         float(len(artifacts)),
-        "no non-product marks on the background",
+        "nothing on the background except the product",
         reason=(
-            f"{len(artifacts)} non-product region(s) on the background ({hints}); "
-            f"largest covers {artifacts[0]['area_frac']:.2%} of the frame"
+            f"{len(artifacts)} spot(s) on the background that are not part of the "
+            f"product ({hints}); the largest covers {artifacts[0]['area_frac']:.2%} "
+            "of the photo"
         ),
         detail=detail,
     )
+
+
+# Where and how big, never what. These describe geometry the check measured;
+# naming the mark ("a logo") would be a classification it cannot make.
+_HINT_WORDS: dict[str, str] = {
+    "border_ring": "a border around the edge",
+    "corner_badge": "a small mark in a corner",
+    "extra_object": "a large separate object",
+    "artifact": "a small mark",
+}
 
 
 def _in_corner(cy: float, cx: float, h: int, w: int, frac: float) -> bool:
@@ -939,7 +991,11 @@ def build_audit_payload(
             # secondary image's occupancy number could be read as a violation.
             # Verdict-vs-measurement is carried structurally instead, by which
             # list a finding lands in.
-            legend[code] = {"check": res.check_id, "rule": res.rule}
+            legend[code] = {
+                "check": res.check_id,
+                "title": title_for(res.check_id),
+                "rule": res.rule,
+            }
         return code
 
     grouped: dict[tuple, list[int]] = {}
@@ -1014,13 +1070,26 @@ def build_audit_payload(
     if count_check.status != "pass":
         remember(count_check)
 
+    # A fix only where a rule was actually broken. The legend also holds codes
+    # that were merely measured (an advisory check, or a main-image rule on a
+    # secondary photo), and a "how to fix" beside one of those would assert the
+    # very problem the `f`/`n_measured_only` split exists to withhold.
+    broken = {f[0] for g in groups for f in g["f"]}
+    if count_check.status != "pass":
+        broken.add(_CHECK_CODES["image_count"])
+    for code in broken:
+        fix = fix_for(legend[code]["check"], rules)
+        if fix:
+            legend[code]["fix"] = fix
+
     payload_caveat = None
     if main_index is None:
         # Unmissable, because a consumer that misses it will write "your main
         # image fails X" about an image nobody identified as the main one.
         payload_caveat = (
             "The main image was not identified, so the three main-image rules "
-            "(white background, frame occupancy, background marks) were NOT "
+            "(white background, product size in the photo, anything else on "
+            "the background) were NOT "
             "evaluated and no verdict on them exists. Do not state or imply "
             "anything about whether they pass or fail. To get a verdict, the "
             "seller must upload their images and say which one is the main "
@@ -1045,6 +1114,16 @@ def build_audit_payload(
                 "count of diagnostic measurements that are NOT rule verdicts. "
                 "Their values are deliberately not included. Do not speculate "
                 "about them or describe them as problems."
+            ),
+            **(
+                {
+                    "fix": (
+                        "how the seller reshoots to pass; base next steps on it in "
+                        "plain words, never naming check codes or tools"
+                    )
+                }
+                if any("fix" in entry for entry in legend.values())
+                else {}
             ),
         },
         "set_checks": (

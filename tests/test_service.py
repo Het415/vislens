@@ -114,6 +114,8 @@ def test_upload_audits_a_compliant_set(client):
     assert body["n_images"] == 6
     assert body["audit_id"]
     assert body["legend"] == {}  # nothing breached, so nothing in the legend
+    assert "fix" not in body["duplicates"]  # no duplicates, nothing to fix
+    assert "fix" not in body["key"]
 
 
 def test_a_single_compliant_image_still_warns_on_the_count(client):
@@ -387,6 +389,8 @@ def test_duplicate_images_are_found_and_warn(client):
 
     assert body["duplicates"]["clusters"] == [[0, 1]]
     assert body["headline"] == "warn"
+    # And it says what to do about it, so the agent does not improvise one.
+    assert "different shot" in body["duplicates"]["fix"]
 
 
 def test_duplicate_finding_names_its_calibration(client):
