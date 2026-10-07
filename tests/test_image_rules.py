@@ -265,6 +265,150 @@ def test_subtle_noise_does_not_trigger_the_gradient_fallback(rules):
     assert res.status == "skipped"
 
 
+# ── frame_occupancy on a non-white backdrop ───────────────────────────────────
+
+GREY = (200, 200, 200)
+
+
+@pytest.mark.parametrize(
+    ("bg", "product", "rows", "cols", "expected"),
+    [
+        (GREY, (0, 0, 0), (200, 800), (150, 650), "fail"),  # 600x500 -> 0.30
+        ((180, 140, 90), (0, 0, 0), (25, 975), (25, 975), "pass"),  # 950^2 -> 0.9025
+        ((60, 90, 200), (0, 0, 0), (300, 700), (300, 700), "fail"),  # 400^2 -> 0.16
+        # Touches the top and bottom edges: 1000x900 -> 0.90, and the product
+        # now covers 46% of the border, so the backdrop only just has the mode.
+        (GREY, (0, 0, 0), (0, 1000), (50, 950), "pass"),
+        # Near-white is the product here, not the background. Against white
+        # this square would be invisible; against the measured grey it is not.
+        (GREY, (255, 255, 255), (300, 700), (300, 700), "fail"),  # 0.16
+    ],
+)
+def test_bbox_occupancy_on_a_non_white_backdrop_is_analytic(
+    bg, product, rows, cols, expected, rules
+):
+    """The false pass this path closes, measured exactly.
+
+    Against white, everything on a grey or coloured backdrop is "not
+    near-white", so the bbox was the whole frame and occupancy read 1.0 for a
+    product of any size. Cut from the measured backdrop colour instead, a known
+    rectangle has an exactly computable bbox again.
+    """
+    (y0, y1), (x0, x1) = rows, cols
+    a = canvas(bg=bg)
+    a[y0:y1, x0:x1] = product
+    res = check_frame_occupancy(decode(a, rules), rules)
+
+    assert res.detail["mask_method"] == "background_colour"
+    assert res.detail["background_rgb"] == list(bg)
+    assert res.detail["bbox"] == [x0, y0, x1 - 1, y1 - 1]
+    assert res.value == pytest.approx((y1 - y0) * (x1 - x0) / AREA)
+    assert res.status == expected
+
+
+def test_seller_hears_about_size_and_background_from_one_audit(rules):
+    """The photo that exposed the false pass, as a seller would upload it.
+
+    JPEG, not PNG, deliberately: it is the reported case, and JPEG noise is
+    what `background_match_tolerance` has to absorb. Before, the main-image
+    audit failed only `white_background` and passed occupancy at 1.0; the
+    seller reshot on white and was then failed on occupancy, a problem the
+    first audit could have reported. Both have to arrive together.
+    """
+    a = np.full((600, 800, 3), (226, 226, 222), dtype=np.uint8)
+    a[200:420, 300:520] = (40, 60, 90)
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, "JPEG")
+    img = decode_for_audit(buf.getvalue(), rules)
+    by_id = {r.check_id: r for r in audit_image(img, rules, is_main=True)}
+
+    assert by_id["white_background"].status == "fail"
+    occ = by_id["frame_occupancy"]
+    assert occ.status == "fail"
+    assert occ.detail["mask_method"] == "background_colour"
+    # 220x220 of 800x600; JPEG ringing may move an edge by a pixel.
+    assert occ.value == pytest.approx(220 * 220 / (800 * 600), abs=0.003)
+
+
+def test_blank_grey_photo_is_skipped_not_passed(rules):
+    """A grey photo with nothing on it used to read as a product filling the
+    whole frame, and pass. Cut from the measured grey it is what it is: blank,
+    which is missing information rather than a verdict either way."""
+    res = check_frame_occupancy(decode(canvas(bg=GREY), rules), rules)
+    assert res.status == "skipped"
+    assert res.detail["mask_method"] == "background_colour"
+
+
+def test_off_white_backdrop_stays_on_the_near_white_mask(rules):
+    """The boundary of the new path. (248,248,248) is near-white, so the
+    original mask already separates the product from it, and switching
+    methods there would change verdicts nobody reported as wrong."""
+    res = check_frame_occupancy(
+        decode(centered_square(400, bg=(248, 248, 248)), rules), rules
+    )
+    assert res.detail["mask_method"] == "near_white"
+    assert "background_rgb" not in res.detail
+    assert res.value == pytest.approx(0.16, abs=0.004)
+
+
+def test_dark_product_filling_a_white_frame_is_not_mistaken_for_a_backdrop(rules):
+    """The regression the band cap guards against.
+
+    A black product spanning the full height and all but 15px of the width
+    covers 81% of the border, so black is the border's modal colour. Cutting
+    from black would find only the white strip, a ~1.5% "product", on a photo
+    that is compliant. The white strip is 19% of the border, which is more
+    than `white_background`'s own cap allows a non-white backdrop, so the
+    near-white mask stays.
+    """
+    a = canvas()
+    a[:, 15:] = 0
+    img = decode(a, rules)
+    res = check_frame_occupancy(img, rules)
+
+    assert res.detail["mask_method"] == "near_white"
+    assert res.status == "pass"
+    assert res.value == pytest.approx(985 / 1000)
+    assert check_white_background(img, rules).status == "pass"
+
+
+def test_cut_that_finds_only_edge_slivers_is_not_kept(rules):
+    """The regression the centre rule guards against.
+
+    The same dark product on a grey backdrop makes black the border's mode,
+    and nothing near-white is left to say otherwise. Cutting from black then
+    finds the grey strip at the edge, which never reaches the centre where a
+    product is, and would report it as a 1.5% product.
+    """
+    a = canvas(bg=GREY)
+    a[:, 15:] = 0
+    res = check_frame_occupancy(decode(a, rules), rules)
+    assert res.detail["mask_method"] == "near_white"
+    assert res.status == "pass"
+
+    # Shown, not assumed: a central region covering the whole frame disables
+    # the rule, and the confident wrong number comes back.
+    rules["checks"]["background_artifacts"]["central_region_frac"] = 1.0
+    unguarded = check_frame_occupancy(decode(a, rules), rules)
+    assert unguarded.detail["background_rgb"] == [0, 0, 0]
+    assert unguarded.value == pytest.approx(15 / 1000)
+
+
+def test_border_with_no_dominant_colour_is_not_treated_as_a_backdrop(rules):
+    """Cutting from a colour that is not the background would be inventing the
+    evidence. Random colour on every pixel has no one backdrop, so its most
+    common pixel covers almost none of the border and the method stays
+    near-white."""
+    rng = np.random.default_rng(0)
+    a = rng.integers(0, 200, size=(400, 400, 3), dtype=np.uint8)
+    res = check_frame_occupancy(decode(a, rules), rules)
+    assert res.detail["mask_method"] == "near_white"
+
+    rules["checks"]["frame_occupancy"]["background_min_band_frac"] = 0.0
+    unguarded = check_frame_occupancy(decode(a, rules), rules)
+    assert unguarded.detail["mask_method"] == "background_colour"
+
+
 # ── background_artifacts (tier measured) ──────────────────────────────────────
 
 
@@ -611,8 +755,9 @@ def test_seller_facing_text_has_no_auditor_jargon(rules):
     """Everything a seller reads for a failing main image: the title, the rule,
     the per-image reason and the fix. Each of these words reached a seller
     before and meant nothing to them."""
-    # Two photos, because a grey background reads as one product filling the
-    # whole frame, so no single image can fail all of these at once.
+    # Two photos, because a mark on a grey background merges with it into one
+    # non-white region, so no single image fails both the background check and
+    # the marks check.
     small = centered_square(200, size=600)
     small[10:40, 10:40] = (255, 0, 0)  # a mark in the corner
     grey = centered_square(500, size=600, bg=(200, 200, 200))

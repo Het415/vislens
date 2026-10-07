@@ -252,6 +252,19 @@ def near_white_mask(rgb: np.ndarray, min_channel: int, max_spread: int) -> np.nd
     return (mn >= min_channel) & ((mx - mn) <= max_spread)
 
 
+def near_colour_mask(
+    rgb: np.ndarray, colour: tuple[int, int, int], tolerance: int
+) -> np.ndarray:
+    """Pixels within `tolerance` of `colour` on every channel.
+
+    The measured-backdrop counterpart of `near_white_mask`, for a background
+    that is not white. Works on any `(..., 3)` array, so it reads a border band
+    as readily as a whole image.
+    """
+    diff = np.abs(rgb.astype(np.int16) - np.asarray(colour, dtype=np.int16))
+    return diff.max(axis=-1) <= tolerance
+
+
 def _border_band_mask(h: int, w: int, frac: float, min_px: int) -> np.ndarray:
     band = max(int(min_px), int(round(frac * min(h, w))))
     band = min(band, max(1, min(h, w) // 2))
@@ -301,26 +314,104 @@ def _clean_components(
     return labels, keep
 
 
+def _measured_background(
+    rgb: np.ndarray, rules: dict[str, Any]
+) -> tuple[int, int, int] | None:
+    """The backdrop's colour when the border shows one that is clearly not
+    white, else `None` and the near-white premise stands.
+
+    All three conditions read the border band `white_background` measures:
+
+    * More than `max_band_product_frac` of it is not near-white. That is the
+      cap `white_background` uses to call a non-white border a backdrop rather
+      than a product touching the edge, so the two checks agree on what the
+      background is. A dark product filling most of a white frame still leaves
+      white along the rest of the edge, and keeps the near-white mask.
+    * Its modal colour is not near-white.
+    * That colour, within `background_match_tolerance`, covers at least
+      `background_min_band_frac` of the band. A border with no one dominant
+      colour (a busy scene, a strong lighting gradient) has no backdrop to cut
+      the product from, and its most common pixel is not one.
+    """
+    occ = rules["checks"]["frame_occupancy"]
+    wb = rules["checks"]["white_background"]
+    h, w = rgb.shape[:2]
+    band = _border_band_mask(h, w, wb["border_band_frac"], wb["border_band_min_px"])
+    band_rgb = rgb[band][np.newaxis]  # (1, N, 3): the shape the masks expect
+
+    white = near_white_mask(band_rgb, wb["near_white_min_channel"], wb["near_white_max_spread"])
+    if 1.0 - white.mean() <= wb["max_band_product_frac"]:
+        return None
+
+    modal = _modal_rgb(rgb, band)
+    if near_white_mask(
+        np.array([[modal]], dtype=np.uint8),
+        wb["near_white_min_channel"],
+        wb["near_white_max_spread"],
+    )[0, 0]:
+        return None
+
+    covered = near_colour_mask(band_rgb, modal, occ["background_match_tolerance"]).mean()
+    if covered < occ["background_min_band_frac"]:
+        return None
+    return modal
+
+
 def product_mask(
     rgb: np.ndarray, rules: dict[str, Any] | None = None
-) -> tuple[np.ndarray, str]:
-    """The product silhouette, and which method produced it.
+) -> tuple[np.ndarray, str, tuple[int, int, int] | None]:
+    """The product silhouette, which method produced it, and the backdrop
+    colour it was cut from (`None` unless that colour was measured).
 
-    Primary method is "everything that is not near-white". The fallback exists
-    for white, transparent, and glass products, where that mask is nearly empty:
-    it rebuilds from gradient magnitude instead. The method name is returned
-    because a verdict derived from a fallback path has to say it used one.
+    Primary method is "everything that is not near-white". Its premise is a
+    white background, and a grey or coloured one breaks it completely: the
+    backdrop is not near-white either, so the whole frame reads as product and
+    bbox occupancy as ~1.0 whatever the product's size. Measured on an 800x600
+    JPEG with a (226,226,222) backdrop and a 220x220 product: 1.0 against a
+    true 0.1008. The seller was told to fix the background, reshot, and only
+    then failed on occupancy — a problem the first audit could have reported.
+    So when `_measured_background` finds a clearly non-white backdrop, the
+    product is cut from that colour instead.
+
+    That cut is kept only if what it finds reaches the central region, the same
+    definition of "the product" `_product_labels` uses. A uniform product that
+    covers most of the border makes its own colour the border's mode, and the
+    cut then returns slivers of real backdrop at the edge: a confident, wrong
+    1% occupancy. The near-white reading is the better answer there. A cut that
+    finds nothing at all is a blank photo, and is reported as one.
+
+    The fallback exists for white, transparent, and glass products, where the
+    primary mask is nearly empty: it rebuilds from gradient magnitude instead.
+    The method name is returned because a verdict derived from a fallback path
+    has to say it used one.
     """
     rules = rules or load_rules()
     occ = rules["checks"]["frame_occupancy"]
     wb = rules["checks"]["white_background"]
+    h, w = rgb.shape[:2]
 
-    fg = ~near_white_mask(rgb, wb["near_white_min_channel"], wb["near_white_max_spread"])
-    labels, keep = _clean_components(fg, occ["component_min_area_frac"])
-    mask = np.isin(labels, keep) if keep.size else np.zeros(fg.shape, dtype=bool)
+    mask: np.ndarray | None = None
+    method = "near_white"
+    background = _measured_background(rgb, rules)
+    if background is not None:
+        fg = ~near_colour_mask(rgb, background, occ["background_match_tolerance"])
+        labels, keep = _clean_components(fg, occ["component_min_area_frac"])
+        cut = np.isin(labels, keep) if keep.size else np.zeros(fg.shape, dtype=bool)
+        central = _central_mask(
+            h, w, rules["checks"]["background_artifacts"]["central_region_frac"]
+        )
+        if not cut.any() or (cut & central).any():
+            mask, method = cut, "background_colour"
+        else:
+            background = None
+
+    if mask is None:
+        fg = ~near_white_mask(rgb, wb["near_white_min_channel"], wb["near_white_max_spread"])
+        labels, keep = _clean_components(fg, occ["component_min_area_frac"])
+        mask = np.isin(labels, keep) if keep.size else np.zeros(fg.shape, dtype=bool)
 
     if mask.mean() >= occ["gradient_fallback_max_mask_frac"]:
-        return mask, "near_white"
+        return mask, method, background
 
     gray = rgb.astype(np.float32).mean(axis=2)
     gx = ndimage.sobel(gray, axis=1)
@@ -330,11 +421,11 @@ def product_mask(
         ndimage.binary_closing(edges, structure=_STRUCT, border_value=1)
     )
     labels, keep = _clean_components(filled, occ["component_min_area_frac"])
-    grad_mask = np.isin(labels, keep) if keep.size else np.zeros(fg.shape, dtype=bool)
+    grad_mask = np.isin(labels, keep) if keep.size else np.zeros(mask.shape, dtype=bool)
 
     if grad_mask.sum() > mask.sum():
-        return grad_mask, "gradient"
-    return mask, "near_white"
+        return grad_mask, "gradient", None
+    return mask, method, background
 
 
 def _product_labels(rgb: np.ndarray, rules: dict[str, Any]) -> tuple[np.ndarray, set[int]]:
@@ -661,14 +752,23 @@ def check_frame_occupancy(
     `bbox_occupancy` is the verdict. `silhouette_occupancy` is reported beside
     it and is never the verdict — see the rationale in `rules_v1.json`. Both are
     published so a reader can check the interpretation rather than trust it.
+
+    On a clearly non-white backdrop the product is cut from the measured
+    backdrop colour (see `product_mask`), so this number stays the product's
+    even on a photo `white_background` fails, and the seller hears about both
+    problems from one audit.
     """
     rules = rules or load_rules()
     cfg = rules["checks"]["frame_occupancy"]
-    mask, method = product_mask(img.rgb, rules)
+    mask, method, background = product_mask(img.rgb, rules)
     h, w = mask.shape
     total = float(h * w)
 
-    base = {"mask_method": method, "downscale": round(img.downscale, 4)}
+    base: dict[str, Any] = {"mask_method": method, "downscale": round(img.downscale, 4)}
+    if background is not None:
+        # What the product was cut from, so the number can be checked against
+        # the photo rather than trusted because of the method name.
+        base["background_rgb"] = list(background)
 
     if not mask.any():
         return CheckResult(
